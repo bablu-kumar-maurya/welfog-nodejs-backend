@@ -1,7 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { useParams, useNavigate } from "react-router-dom";
-import axios from "axios";
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL;
+import api from "../../api/axios";
 import {
   MdDelete,
   MdMusicNote,
@@ -46,11 +45,8 @@ const UserMusicUploads = () => {
         setLoading(true);
       }
 
-      const res = await axios.get(
-        `http://localhost:4000/api/reels/users/${userId}/music?page=${page}&limit=${LIMIT}` ,{
-        withCredentials: true
-        }
-      );
+      const res = await api.get(
+        `/api/reels/users/${userId}/music?page=${page}&limit=${LIMIT}`);
 
       setMusic(res.data.music || []);
       setPagination(res.data.pagination);
@@ -66,9 +62,7 @@ const UserMusicUploads = () => {
   const handleDelete = async (track) => {
     try {
 
-      const res = await axios.delete(`http://localhost:4000/api/music/delete/${track._id}` , {
-       withCredentials: true
-      });
+      const res = await api.delete(`/api/music/delete/${track._id}`);
       if (res.data?.success) {
         toast.success("Music deleted");
         setMusic((prev) =>

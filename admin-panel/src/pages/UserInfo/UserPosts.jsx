@@ -1,7 +1,6 @@
 import { useEffect, useState, useRef } from "react";
 import { useParams, useNavigate } from "react-router-dom";
-import axios from "axios";
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL;
+import api from "../../api/axios";
 import {
   MdArrowBack,
   MdPlayArrow,
@@ -63,15 +62,13 @@ const UserPosts = () => {
     try {
       const action = reel.status === "Blocked" ? "unblock" : "block";
 
-      await axios.put(
-        `http://localhost:4000/api/reels/admin_block/${reel._id}`,
+      await api.put(
+        `/api/reels/admin_block/${reel._id}`,
         {
           action,
           reason: action === "block" ? "Admin blocked this reel" : null,
-        },
-        {
-          withCredentials: true,
-        },
+        }
+       
       );
 
       toast.success(
@@ -98,11 +95,8 @@ const UserPosts = () => {
 
   const handleDeleteReel = async (reelId) => {
     try {
-      await axios.delete(
-        `http://localhost:4000/api/reels/admin_delete/${reelId}`,
-        {
-          withCredentials: true,
-        },
+      await api.delete(
+        `/api/reels/admin_delete/${reelId}`
       );
       toast.success("Reel deleted");
       setReels((prev) => prev.filter((r) => r._id !== reelId));
@@ -124,13 +118,10 @@ const UserPosts = () => {
   const fetchPosts = async (skipValue) => {
     try {
       setLoading(true);
-      const res = await axios.get(
-        `http://localhost:4000/api/users/admin_userpost/${id}`,
+      const res = await api.get(
+        `/api/users/admin_userpost/${id}`,
         {
           params: { limit: LIMIT, skip: skipValue, startDate, endDate },
-        },
-        {
-          withCredentials: true,
         },
       );
 
@@ -151,8 +142,7 @@ const UserPosts = () => {
     }
   };
 
-  // ================= INFINITE SCROLL =================
-
+ 
   useEffect(() => {
     if (!hasMore || loading) return;
 

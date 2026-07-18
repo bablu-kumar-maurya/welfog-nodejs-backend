@@ -1,7 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { useParams, useNavigate } from "react-router-dom";
-import axios from "axios";
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL;
+import api from "../../api/axios";
 import {
   MdArrowBack,
   MdFilterList,
@@ -105,12 +104,9 @@ const UserActivityDetails = () => {
         "with params:",
         params,
       );
-      const response = await axios.get(
-        `http://localhost:4000/api/users/${userId}/activity`,
-        { params },
-        {
-          withCredentials: true,
-        },
+      const response = await api.get(
+        `/api/users/${userId}/activity`,
+        { params }
       );
       console.log("Activity data response:", response.data);
       if (response.data) {

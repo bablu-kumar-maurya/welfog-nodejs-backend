@@ -1,9 +1,8 @@
 import { useEffect, useState, useRef } from "react";
 import { useParams, useNavigate } from "react-router-dom";
-import axios from "axios";
+import api from "../../api/axios";
 import { MdArrowBack, MdComment } from "react-icons/md";
 import toast from "react-hot-toast";
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL;
 const UserComments = () => {
   const { userId } = useParams();
   const navigate = useNavigate();
@@ -44,15 +43,14 @@ const UserComments = () => {
       }
       
 
-      const res = await axios.get(
-        `http://localhost:4000/api/comment/user/${userId}`,
+      const res = await api.get(
+        `/api/comment/user/${userId}`,
         {
           params: {
             page,
             startDate: appliedStartDate || undefined,
             endDate: appliedEndDate || undefined
           },
-      withCredentials: true
         }
       );
 
@@ -77,8 +75,8 @@ const UserComments = () => {
     try {
       setReelLoading(true);
   
-      const res = await axios.get(`http://localhost:4000/api/reels/admin_current/${reelId}` , {
-       withCredentials: true
+      const res = await api.get(`/api/reels/admin_current/${reelId}` , {
+       
       });
       setSelectedReel(res.data);
       setShowReelModal(true);

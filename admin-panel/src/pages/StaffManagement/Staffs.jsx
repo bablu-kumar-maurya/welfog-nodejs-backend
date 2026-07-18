@@ -1,10 +1,9 @@
 
 import { useEffect, useState, useRef } from "react";
 import { useNavigate } from "react-router-dom";
-import axios from "axios";
+import api from "../../api/axios";
 import toast from "react-hot-toast";
 import { MdAdd, MdDelete, MdEdit } from "react-icons/md";
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL;
 const Staffs = () => {
   const navigate = useNavigate();
   const topRef = useRef(null);
@@ -24,7 +23,7 @@ const Staffs = () => {
   // ================= FETCH STAFFS =================
   const fetchStaffs = async () => {
     try {
-      const res = await axios.get(`http://localhost:4000/api/roles/staffs/all`, {
+      const res = await api.get(`/api/roles/staffs/all`, {
         params: {
           page,
           limit,
@@ -32,7 +31,7 @@ const Staffs = () => {
           startDate: filters.startDate,
           endDate: filters.endDate
         },
-       withCredentials: true
+       
 
       });
 
@@ -55,9 +54,7 @@ const Staffs = () => {
     try {
       setDeleting(true);
 
-      await axios.delete(`http://localhost:4000/api/roles/staffs/${staffToDelete._id}`, {
-       withCredentials: true
-
+      await api.delete(`/api/roles/staffs/${staffToDelete._id}`, {
       });
 
       toast.success("Staff deleted successfully");
@@ -138,7 +135,8 @@ const Staffs = () => {
             All Staffs
           </h1>
           <p className="text-sm text-gray-500 mt-1">
-            Manage all staff members ({filteredStaffs.length})
+            {/* Manage all staff members ({filteredStaffs.length}) */}
+            Manage all staff members
           </p>
         </div>
 

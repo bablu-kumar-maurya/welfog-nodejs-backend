@@ -1,8 +1,8 @@
 import { useEffect, useState, useRef } from "react";
 import { useParams, useNavigate } from "react-router-dom";
-import axios from "axios";
+import api from "../../api/axios";
 import { MdArrowBack, MdPerson } from "react-icons/md";
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL;
+
 const LIMIT = 10;
 
 const UserFollowers = () => {
@@ -32,12 +32,11 @@ const UserFollowers = () => {
     try {
       setLoading(true);
   
-      const res = await axios.get(`http://localhost:4000/api/users/${userId}/followers`, {
+      const res = await api.get(`/api/users/${userId}/followers`, {
         params: {
           startDate: appliedStartDate || undefined,
           endDate: appliedEndDate || undefined
         },
-       withCredentials: true
       });
 console.log("API Response:", res.data);
       // ✅ REMOVE NULL VALUES (VERY IMPORTANT)

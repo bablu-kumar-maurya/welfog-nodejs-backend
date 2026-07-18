@@ -1,16 +1,11 @@
 
 import { useEffect, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
-import axios from "axios";
+import api from "../../api/axios";
 import { MdArrowBack } from "react-icons/md";
 import toast from "react-hot-toast";
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL;
-// ✅ PATH FIXED: Ek extra '../' lagaya hai kyunki file ab StaffManagement folder ke andar hai
 import { PERMISSIONS_CONFIG } from "../../config/permissions"; 
-const api = axios.create({
-  baseURL: `http://localhost:4000`,
-  withCredentials: true, 
-});
+
 
 const CreateRole = () => {
   const navigate = useNavigate();
@@ -27,7 +22,7 @@ const CreateRole = () => {
     const fetchRole = async () => {
       try {
         setLoading(true);
-        const res = await api.get(`http://localhost:4000/api/roles/${id}`);
+        const res = await api.get(`/api/roles/${id}`);
 
         setName(res.data.name);
 
@@ -70,7 +65,7 @@ const CreateRole = () => {
       setLoading(true);
 
       if (isEdit) {
-        await api.put(`http://localhost:4000/api/roles/${id}`, {
+        await api.put(`/api/roles/${id}`, {
           name,
           permissions: selectedPermissions,
         });

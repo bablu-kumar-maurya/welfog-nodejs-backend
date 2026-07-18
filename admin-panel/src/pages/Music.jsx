@@ -1,9 +1,8 @@
 
 import { useState, useEffect, useMemo, useRef } from 'react';
-import axios from 'axios';
+import api from "../api/axios";
 import { MdSearch, MdDelete, MdMusicNote, MdPlayArrow } from 'react-icons/md';
 import toast from 'react-hot-toast';
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL;
 const Music = () => {
   const [musicTracks, setMusicTracks] = useState([]);
   const [filteredTracks, setFilteredTracks] = useState([]);
@@ -41,7 +40,7 @@ const Music = () => {
 
       const { search, startDate, endDate } = filters;
     
-      const res = await axios.get(`http://localhost:4000/api/music/admin-view`, {
+      const res = await api.get(`/api/music/admin-view`, {
         params: {
           page,
           limit: LIMIT,
@@ -49,8 +48,6 @@ const Music = () => {
           startDate,
           endDate
         },
-
-     withCredentials: true 
 
       });
 
@@ -74,8 +71,7 @@ const Music = () => {
   const handleDelete = async (track) => {
     try {
      
-      await axios.delete(`http://localhost:4000/api/music/delete/${track._id}`, {
-   withCredentials: true 
+      await api.delete(`/api/music/delete/${track._id}`, {
       }
 
       );

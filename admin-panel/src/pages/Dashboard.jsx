@@ -1,8 +1,8 @@
 import { useState, useEffect } from 'react';
-import axios from 'axios';
+import api from "../api/axios";
 import StatCard from '../components/StatCard';
 import { useNavigate } from 'react-router-dom';
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL;
+
 import {
   MdPeople,
   MdVideoLibrary,
@@ -57,27 +57,27 @@ const Dashboard = () => {
     
       // Fetch dashboard data from backend
       const results = await Promise.allSettled([
-        axios.get(`http://localhost:4000/api/users/admin_users`, {
-         withCredentials: true 
+        api.get(`/api/users/admin_users`, {
+        
         }
         ),
-        axios.get(`http://localhost:4000/api/reels/admin_reels`, {
-          withCredentials: true 
+        api.get(`/api/reels/admin_reels`, {
+          
 
         }),
-        axios.get(`http://localhost:4000/api/music/admin-view`, {
-           withCredentials: true 
+        api.get(`/api/music/admin-view`, {
+           
 
         }),
-        axios.get(`http://localhost:4000/api/comment/admin-view`, {
-          withCredentials: true 
+        api.get(`/api/comment/admin-view`, {
+         
         }),
-        axios.get(`http://localhost:4000/api/reels/totallikes`, {
-          withCredentials: true 
+        api.get(`/api/reels/totallikes`, {
+         
 
         }),
-        axios.get(`http://localhost:4000/api/reels/totalviews`, {
-          withCredentials: true 
+        api.get(`/api/reels/totalviews`, {
+      
 
         }),
       ]);

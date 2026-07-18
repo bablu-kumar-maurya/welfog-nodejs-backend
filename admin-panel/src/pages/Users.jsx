@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
-import axios from "axios";
+import api from "../api/axios";
 import {
   MdSearch,
   MdVisibility,
@@ -15,7 +15,7 @@ import toast from "react-hot-toast";
 // ✅ Excel Import added (PDF removed)
 import * as XLSX from "xlsx";
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL;
+
 
 const Users = () => {
   const navigate = useNavigate();
@@ -61,8 +61,8 @@ const Users = () => {
 
       const { search, status, startDate, endDate } = filters;
 
-      const response = await axios.get(
-        `http://localhost:4000/api/users/admin_users`,
+      const response = await api.get(
+        `/api/users/admin_users`,
         {
           params: {
             page,
@@ -72,7 +72,6 @@ const Users = () => {
             startDate,
             endDate,
           },
-          withCredentials: true,
         },
       );
 
@@ -106,14 +105,14 @@ const Users = () => {
 
   const handleSuspendToggle = async (userId, currentStatus, reason = "") => {
     try {
-      await axios.put(
-        `http://localhost:4000/api/users/admin_users/${userId}`,
+      await api.put(
+        `/api/users/admin_users/${userId}`,
         {
           isSuspended: !currentStatus,
           suspendReason: reason,
         },
         {
-          withCredentials: true,
+        
         }
       );
 
@@ -133,10 +132,10 @@ const Users = () => {
 
   const handleDeleteUser = async (userId) => {
     try {
-      await axios.delete(
-        `http://localhost:4000/api/users/admin_users/${userId}`,
+      await api.delete(
+        `/api/users/admin_users/${userId}`,
         {
-          withCredentials: true,
+          
         },
       );
 
@@ -262,7 +261,8 @@ const Users = () => {
         <div className="w-full sm:w-auto">
           <h1 className="text-2xl sm:text-3xl font-bold text-gray-900 mb-1 sm:mb-2">Users</h1>
           <p className="text-gray-500 text-sm sm:text-base">
-            Manage all registered users ({totalUsers})
+            {/* Manage all registered users ({totalUsers}) */}
+             Manage all registered users 
           </p>
         </div>
         

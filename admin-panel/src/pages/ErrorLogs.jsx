@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import axios from "axios";
+import api from "../api/axios";
 
 const ErrorLogs = () => {
     const [logs, setLogs] = useState([]);
@@ -12,7 +12,7 @@ const ErrorLogs = () => {
 
     const fetchLogs = async () => {
         try {
-            let url = `http://localhost:4000/api/admin/errors?page=${page}`;
+            let url = `/api/admin/errors?page=${page}`;
 
             if (startDate) {
                 url += `&startDate=${startDate}`;
@@ -22,8 +22,7 @@ const ErrorLogs = () => {
                 url += `&endDate=${endDate}`;
             }
 
-            const res = await axios.get(url, {
-               withCredentials: true 
+            const res = await api.get(url, {
             });
 
             setLogs(res.data.logs || []);

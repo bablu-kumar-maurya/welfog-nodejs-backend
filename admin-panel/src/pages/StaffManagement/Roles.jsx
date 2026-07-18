@@ -1,14 +1,10 @@
 
 import { useEffect, useState, useRef } from "react";
 import { useNavigate } from "react-router-dom";
-import axios from "axios";
+import api from "../../api/axios";
 import { MdAdd, MdDelete, MdEdit } from "react-icons/md";
 import toast from "react-hot-toast";
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL;
-const api = axios.create({
-  baseURL: `http://localhost:4000`,
-  withCredentials: true, 
-});
+
 
 const PER_PAGE = 10;
 
@@ -33,7 +29,7 @@ const Roles = () => {
   const fetchRoles = async () => {
   try {
     setLoading(true);
-    const res = await api.get(`http://localhost:4000/api/roles`);
+    const res = await api.get(`/api/roles`);
 
     setRoles(Array.isArray(res.data.roles) ? res.data.roles : []);
 
@@ -61,7 +57,7 @@ const Roles = () => {
 
   const deleteRole = async () => {
     try {
-      await api.delete(`http://localhost:4000/api/roles/${roleToDelete}`);
+      await api.delete(`/api/roles/${roleToDelete}`);
       toast.success("Role deleted successfully");
       setRoles((prev) => prev.filter((r) => r._id !== roleToDelete));
       closeDeleteModal();
@@ -144,7 +140,8 @@ const Roles = () => {
               All Roles
             </h1>
             <p className="text-sm text-gray-500 mt-1">
-              Manage all roles ({filteredRoles.length})
+              {/* Manage all roles ({filteredRoles.length}) */}
+                    Manage all roles 
             </p>
           </div>
 

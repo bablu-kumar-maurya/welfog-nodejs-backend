@@ -1,8 +1,7 @@
 import { useState, useEffect } from 'react'; 
 import { MdSettings, MdSave, MdLock } from 'react-icons/md';
 import toast from 'react-hot-toast';
-import axios from "axios";
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL;
+import api from "../api/axios";
 const Settings = () => {
   const [settings, setSettings] = useState({
     siteName: '',
@@ -23,8 +22,7 @@ const Settings = () => {
     const fetchSettings = async () => {
       try {
     
-        const response = await axios.get(`http://localhost:4000/api/admin/verify`, {
-          withCredentials: true 
+        const response = await api.get(`/api/admin/verify`, {
         });
         
         if (response.data.success) {
@@ -51,11 +49,10 @@ const Settings = () => {
   const handleSaveSettings = async () => {
     const loadingToast = toast.loading("Updating settings...");
     try {
-      await axios.put(
-        `http://localhost:4000/api/admin/settings`, 
+      await api.put(
+        `/api/admin/settings`, 
         settings,
         {
-            withCredentials: true 
         }
       );
 
@@ -76,14 +73,14 @@ const Settings = () => {
     }
     try {
      
-      await axios.put(
-        `http://localhost:4000/api/admin/change-password`,
+      await api.put(
+        `/api/admin/change-password`,
         {
           currentPassword: passwordChange.currentPassword,
           newPassword: passwordChange.newPassword,
         },
         {
-          withCredentials: true 
+          
         }
       );
       toast.success("Password changed successfully");

@@ -1,11 +1,10 @@
 
-
 import { useEffect, useState, useRef } from "react";
 import { useParams, useNavigate } from "react-router-dom";
-import axios from "axios";
+import api from "../../api/axios";
 import { MdArrowBack, MdFavorite } from "react-icons/md";
 import toast from "react-hot-toast";
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL;
+
 const LIMIT = 10;
 
 const UserLikedComments = () => {
@@ -34,10 +33,8 @@ const UserLikedComments = () => {
     try {
       setLoading(true);
 
-      const res = await axios.get(
-        `http://localhost:4000/api/comment/admin/users/${userId}/liked-comments` , {
-         withCredentials: true
-        }
+      const res = await api.get(
+        `/api/comment/admin/users/${userId}/liked-comments`
       );
 
       const list = res.data.comments || [];
@@ -74,9 +71,7 @@ const UserLikedComments = () => {
     try {
       setReelLoading(true);
 
-      const res = await axios.get(`http://localhost:4000/api/reels/admin_current/${reelId}` , {
-      withCredentials: true
-      });
+      const res = await api.get(`/api/reels/admin_current/${reelId}`);
 
       setSelectedReel(res.data);
       setShowReelModal(true);
@@ -88,12 +83,11 @@ const UserLikedComments = () => {
     }
   };
 
-  // ================= LOADER =================
   if (loading) {
     return <div className="spinner" />;
   }
 
-  // ================= UI =================
+
   return (
    <div className="space-y-6 p-4 sm:p-6 bg-white min-h-screen" ref={topRef}>
       {/* Header */}

@@ -1,7 +1,6 @@
 import { useEffect, useState, useRef } from "react";
 import { useParams, useNavigate } from "react-router-dom";
-import axios from "axios";
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL;
+import api from "../../api/axios";
 import {
   MdArrowBack,
   MdPlayArrow,
@@ -24,7 +23,7 @@ const UserLikedReels = () => {
   const [activeVideoId, setActiveVideoId] = useState(null);
   const [confirmBlockReel, setConfirmBlockReel] = useState(null);
   const [confirmDeleteReel, setConfirmDeleteReel] = useState(null);
-  const LIMIT = 8;
+  const LIMIT = 10;
   const [page, setPage] = useState(1);
   const [totalPages, setTotalPages] = useState(1);
   const [slideDirection, setSlideDirection] = useState(1); // 1 = next (up), -1 = prev (down)
@@ -50,14 +49,13 @@ const UserLikedReels = () => {
       // Only show loading overlay on first page load to prevent blinking on page change
       setLoading(pageNo === 1);
       
-      const res = await axios.get(
-        `http://localhost:4000/api/reels/admin/users/${userId}/liked-reels`,
+      const res = await api.get(
+        `/api/reels/admin/users/${userId}/liked-reels`,
         {
           params: {
             page: pageNo,
             limit: LIMIT,
           },
-      withCredentials: true
         } , 
         
       );
@@ -104,11 +102,9 @@ const UserLikedReels = () => {
     try {
        
       const action = reel.status === "Blocked" ? "unblock" : "block";
-      await axios.put(`http://localhost:4000/api/reels/admin_block/${reel._id}`, {
+      await api.put(`/api/reels/admin_block/${reel._id}`, {
         action,
         reason: action === "block" ? "Admin blocked this reel" : null,
-      } , {
-       withCredentials: true
       });
 
       toast.success(action === "block" ? "Reel blocked" : "Reel unblocked");
@@ -128,11 +124,8 @@ const UserLikedReels = () => {
  const handleDeleteReel = async (reel) => {
   try {
 
-    await axios.delete(
-      `http://localhost:4000/api/reels/admin_delete/${reel._id}/${reel.userid}` ,{
-       withCredentials: true
-      }
-    );
+    await api.delete(
+      `/api/reels/admin_delete/${reel._id}/${reel.userid}`);
 
     toast.success("Reel deleted");
 

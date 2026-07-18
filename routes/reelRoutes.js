@@ -4,1026 +4,216 @@ const router = express.Router();
 const Comment = require("../models/Comment");
 const Reel = require("../models/Reel");
 const User = require("../models/Users");
-const Music = require("../models/Music"); // <-- import Music model
+const Music = require("../models/Music"); 
 const multer = require("multer");
 const logUserAction = require("../utils/logUserAction");
 const fs = require("fs");
 const path = require("path");
-const ffmpeg = require("fluent-ffmpeg");
-const ffmpegInstaller = require("@ffmpeg-installer/ffmpeg");
 const tmp = require("tmp");
-const http = require("http");
-const https = require("https");
-const os = require("os");
-const ffprobeStatic = require('ffprobe-static');
 const { uploadToS3 } = require("../lib/s3");
-ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 const adminAuth = require("../middleware/adminAuth");
 const checkPermission = require("../middleware/checkPermission");
 const createNotification = require("../utils/createNotification");
 const logError = require("../utils/logError");
 const { generateShortLink } = require("../utils/shortLink");
 const ReelInteraction = require('../models/ReelInteraction');
-// ---------- Adaptive compressor (paste after ffmpeg.setFfmpegPath(...)) ----------
-async function compressVideo(inputPath, outputPath) {
-    const metadata = await new Promise((resolve, reject) => {
-        ffmpeg.ffprobe(inputPath, (err, data) => {
-            if (err) return reject(err);
-            resolve(data);
-        });
-    });
 
-    const video = metadata.streams.find(s => s.codec_type === "video");
-    const width = video.width;
-    const height = video.height;
-    const duration = parseFloat(video.duration); // seconds
+// ===== NEW: REDIS & QUEUE SETUP =====
+const { Queue } = require('bullmq');
+const IORedis = require('ioredis');
+// Default Redis connection (Localhost). Agar production par ho toh actual Redis URL dalna.
+const redisConnection = new IORedis({ maxRetriesPerRequest: null }); 
+const reelQueue = new Queue('reel-processing', { connection: redisConnection });
+// =====================================
 
-    const originalSizeMB = (fs.statSync(inputPath).size / (1024 * 1024));
+// S3 Presigned URL Generator ke liye AWS SDK zaroori hai
+// (Make sure you have @aws-sdk/client-s3 installed if using AWS v3)
+const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
+const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
-    let crf, bps, scaleFilter;
-
-    // ---------------------------
-    // ⭐ 1 to 3 minute category ⭐
-    // ---------------------------
-    if (duration >= 60 && duration <= 180) {
-
-        if (originalSizeMB <= 40) {
-            // Small source → high quality
-            crf = 23;
-            bps = 1100;
-        }
-
-        else if (originalSizeMB <= 100) {
-            // Medium source → balanced
-            crf = 25;
-            bps = 900;
-        }
-        else {
-            // ⭐ Large source → MORE compression but SAFE ⭐
-            crf = 27;
-            bps = 700;   // reduce bitrate
-        }
-
-        scaleFilter = "scale=720:-2";
-    }
-
-    // ---------------------------
-    // ⭐ Other durations ⭐
-    // ---------------------------
-    else if (duration < 60) {
-        // Short videos
-        crf = 22;
-        bps = 1500;
-        scaleFilter = "scale=720:-2";
-    }
-    else if (duration > 180) {
-        // Long videos
-        crf = 28;
-        bps = 650;
-        scaleFilter = "scale=720:-2";
-    }
-
-    // If video resolution already low → use lower scale
-    if (width < 1280) {
-        scaleFilter = "scale=540:-2";
-    }
-
-    return new Promise((resolve, reject) => {
-        ffmpeg(inputPath)
-            .videoFilters(scaleFilter)
-            .outputOptions([
-                "-c:v libx264",
-                `-b:v ${bps}k`,
-                `-maxrate ${bps}k`,
-                `-bufsize ${bps * 2}k`,
-                `-crf ${crf}`,
-                "-preset veryfast",
-                "-c:a aac",
-                "-b:a 128k",
-                "-movflags +faststart",
-                "-y"
-            ])
-            .save(outputPath)
-            .on("end", resolve)
-            .on("error", reject);
-    });
-}
-
-
-// -------------------------------------------------------------------------------
+const s3Client = new S3Client({
+    region: process.env.AWS_REGION,
+    credentials: {
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+    },
+});
 
 const upload = multer({
     storage: multer.memoryStorage(),
-    limits: { fileSize: 200 * 1024 * 1024 } // allow up to 200MB
+    limits: { fileSize: 200 * 1024 * 1024 } 
 });
-/**
- * Uses ffprobe to get the duration of an audio/video file.
- * @param {string} filePath - Path to the local file.
- * @returns {Promise<number>} Duration in seconds (rounded).
- */
-ffmpeg.setFfprobePath(ffprobeStatic.path);
-function getAudioDuration(filePath) {
-    return new Promise((resolve, reject) => {
-        ffmpeg.ffprobe(filePath, (err, metadata) => {
-            if (err) {
-                return reject(err);
-            }
-            const duration = metadata?.format?.duration;
-            if (duration && !isNaN(parseFloat(duration))) {
-                resolve(Math.round(parseFloat(duration)));
-            } else {
-                // If duration cannot be determined, resolve to 0 or a sensible default
-                resolve(0);
-            }
-        });
-    });
-}
 
 // =================================================================
-// === 1. DOWNLOAD HELPER (Unchanged) ===
+// === NEW ROUTE: GENERATE PRESIGNED URL FOR DIRECT S3 UPLOAD ===
 // =================================================================
-
-async function downloadFileToTemp(url, ext = '.tmp') {
-    const MAX_REDIRECTS = 5;
-    let redirects = 0;
-    let currentUrl = url;
-    const tmpFile = tmp.fileSync({ postfix: ext });
-
-    return new Promise((resolve, reject) => {
-
-        function getFile(fileUrl) {
-            if (redirects >= MAX_REDIRECTS) {
-                tmpFile.removeCallback();
-                return reject(new Error('Exceeded maximum redirects.'));
-            }
-
-            const getter = (fileUrl.startsWith("http://") ? http : https);
-            getter.get(fileUrl, (response) => {
-                const statusCode = response.statusCode;
-
-                // 1. Handle Redirects (3xx)
-                if (statusCode >= 300 && statusCode < 400 && response.headers.location) {
-                    redirects++;
-                    currentUrl = new URL(response.headers.location, fileUrl).href; // Resolve relative redirects
-                    response.resume(); // Consume the response data
-                    return getFile(currentUrl); // Recursive call to follow the redirect
-                }
-
-                // 2. Handle Success (200)
-                if (statusCode === 200) {
-                    const file = fs.createWriteStream(tmpFile.name);
-                    response.pipe(file);
-                    file.on("finish", () => {
-                        file.close(() => resolve(tmpFile));
-                    });
-                    file.on("error", (err) => {
-                        tmpFile.removeCallback();
-                        reject(err);
-                    });
-                    return;
-                }
-
-                // 3. Handle Other Errors
-                tmpFile.removeCallback();
-                return reject(new Error(`Failed to download file, Status Code: ${statusCode}`));
-
-            }).on("error", (err) => {
-                tmpFile.removeCallback();
-                reject(err);
-            });
-        }
-
-        getFile(currentUrl);
-    });
-}
-
-async function convertMp4UrlToHlsAndUpdateReel(reelId, mp4Url) {
-    const tempFiles = [];
-    let hlsDir = null;
+router.post("/generate-upload-url", async (req, res) => {
+    console.log("✅ YAY! Route hit ho gaya!");
     try {
-        const ext = path.extname(new URL(mp4Url).pathname) || ".mp4";
-        const videoTmpObj = await downloadFileToTemp(mp4Url, ext);
-        tempFiles.push(videoTmpObj);
-
-        hlsDir = path.join(os.tmpdir(), `hls-${reelId}`);
-        fs.mkdirSync(hlsDir, { recursive: true });
-
-        const qualityVariants = [
-            { name: "240p", resolution: "426x240", videoBitrate: "250k", audioBitrate: "48k", bandwidth: 380000, hlsTime: 2 },
-            { name: "480p", resolution: "854x480", videoBitrate: "800k", audioBitrate: "96k", bandwidth: 1150000, hlsTime: 2 },
-            { name: "720p", resolution: "1280x720", videoBitrate: "1400k", audioBitrate: "128k", bandwidth: 2100000, hlsTime: 2 },
-        ];
-
-        const generateHLS = async (variant) => {
-            const variantDir = path.join(hlsDir, variant.name);
-            fs.mkdirSync(variantDir, { recursive: true });
-
-            const segmentPattern = path.join(variantDir, "segment_%03d.ts").replace(/\\/g, '/');
-            const outputPath = path.join(variantDir, "index.m3u8").replace(/\\/g, '/');
-
-            return new Promise((resolve, reject) => {
-                ffmpeg(videoTmpObj.name)
-                    .videoFilters(`scale=${variant.resolution}:force_original_aspect_ratio=decrease,pad=ceil(iw/2)*2:ceil(ih/2)*2`)
-                    .videoCodec('libx264')
-                    .audioCodec('aac')
-                    .addOutputOptions([
-                        "-preset", "veryfast",
-                        `-b:v ${variant.videoBitrate}`,
-                        `-maxrate ${variant.videoBitrate}`,
-                        `-bufsize ${parseInt(variant.videoBitrate) * 2}k`,
-                        `-b:a ${variant.audioBitrate}`,
-                        "-sc_threshold", "0",
-                        "-g", `${24 * variant.hlsTime}`,
-                        "-keyint_min", `${24 * variant.hlsTime}`,
-                        "-force_key_frames", `expr:gte(t,n_forced*${variant.hlsTime})`,
-                        "-hls_time", `${variant.hlsTime}`,
-                        "-hls_playlist_type", "vod",
-                        "-hls_list_size", "0",
-                        "-hls_flags", "independent_segments",
-                        "-hls_segment_type", "mpegts",
-                        `-hls_segment_filename`, segmentPattern,
-                        "-f", "hls",
-                        "-y",
-                    ])
-                    .output(outputPath)
-                    .on("end", resolve)
-                    .on("error", reject)
-                    .run();
-            });
-        };
-
-        await Promise.all(qualityVariants.map(generateHLS));
-
-        const masterPlaylistContent = `#EXTM3U
-#EXT-X-VERSION:3
-#EXT-X-INDEPENDENT-SEGMENTS
-${qualityVariants.map(variant =>
-            `#EXT-X-STREAM-INF:BANDWIDTH=${variant.bandwidth},RESOLUTION=${variant.resolution}
-${variant.name}/index.m3u8`
-        ).join('\n')}
-`;
-
-        fs.writeFileSync(path.join(hlsDir, "master.m3u8"), masterPlaylistContent);
-
-        for (const variant of qualityVariants) {
-            const variantDir = path.join(hlsDir, variant.name);
-            const files = fs.readdirSync(variantDir).filter(f => fs.statSync(path.join(variantDir, f)).isFile());
-            for (const file of files) {
-                const filePath = path.join(variantDir, file);
-                const buffer = fs.readFileSync(filePath);
-                await uploadToS3(
-                    {
-                        buffer,
-                        originalname: file,
-                        mimetype: file.endsWith(".m3u8")
-                            ? "application/vnd.apple.mpegurl"
-                            : file.endsWith(".ts")
-                                ? "video/mp2t"
-                                : "application/octet-stream",
-                    },
-                    `videos/reels/${reelId}/${variant.name}`,
-                    true
-                );
-            }
+        const { filename, fileType, isThumbnail } = req.body;
+        if (!filename || !fileType) {
+            return res.status(400).json({ success: false, message: "filename and fileType are required" });
         }
 
-        const masterBuffer = fs.readFileSync(path.join(hlsDir, "master.m3u8"));
-        await uploadToS3(
-            { buffer: masterBuffer, originalname: "master.m3u8", mimetype: "application/vnd.apple.mpegurl" },
-            `videos/reels/${reelId}`,
-            true
-        );
+        const folder = isThumbnail ? "thumbnails/raw" : "videos/raw";
+        const uniqueFileName = `${Date.now()}-${Math.random().toString(36).substring(7)}-${filename}`;
+        const key = `${folder}/${uniqueFileName}`;
 
-        const videoUrl = `https://${process.env.CLOUDFRONT_URL}/videos/reels/${reelId}/master.m3u8`;
-        await Reel.findByIdAndUpdate(reelId, {
-            videoUrl,
-            status: "Published",
-            qualityVariants: qualityVariants.map(q => q.name),
+        const command = new PutObjectCommand({
+            Bucket: process.env.AWS_BUCKET_NAME,
+            Key: key,
+            ContentType: fileType,
+        });
+
+
+        const uploadUrl = await getSignedUrl(s3Client, command, { expiresIn: 900 });
+
+       
+        const rawUrl = `https://${process.env.AWS_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${key}`;
+
+        res.status(200).json({
+            success: true,
+            uploadUrl, 
+            rawUrl,    
+            key
         });
     } catch (err) {
-        await Reel.findByIdAndUpdate(reelId, { status: "Processing" });
-          err.statusCode = err.statusCode || 500;
-        await logError(req, err);
-        console.error("MP4->HLS migration failed:", err);
-    } finally {
-        tempFiles.forEach((t) => { try { if (t) t.removeCallback(); } catch (e) { } });
-        if (hlsDir) { try { fs.rmSync(hlsDir, { recursive: true, force: true }); } catch (e) { } }
+        console.error("Error generating presigned URL:", err);
+        res.status(500).json({ success: false, message: "Could not generate upload URL" });
     }
-}
+});
 
-// =================================================================
-// === 2. WORKER FUNCTION (Updated Logic in Step 3) ===
-// =================================================================
 
-/**
- * Executes the full video processing, HLS conversion, and S3 upload.
- */
-async function processReelUpload(jobData) {
-    console.log(`===== [WORKER: FULL UPLOAD JOB STARTED for user ${jobData.userid}] =====`);
-    // --- UPDATED DESTRUCTURING to include externalAudioData ---
-    const { videoBuffer, videoOriginalname, thumbBuffer, externalAudioData, ...reelMetadata } = jobData;
-    const { user, userid, username, name, caption, musicId, videoStartTime, videoEndTime } = reelMetadata;
-
-    const tempFiles = [];
-    let videoFileWithFinalAudioPath = null;
-    let finalMusicId = musicId || null;
-    let newReelId = null;
-    let hlsDir = null;
-
+router.post("/full-upload", async (req, res) => {
+console.log("HEADERS =", req.headers);
+    console.log("CONTENT TYPE =", req.headers["content-type"]);
+    console.log("BODY =", req.body);
     try {
-        // Step 1: Write uploaded video buffer to temp file
-        const inputTmp = tmp.fileSync({ postfix: path.extname(videoOriginalname) });
-        tempFiles.push(inputTmp);
-        fs.writeFileSync(inputTmp.name, videoBuffer);
+        // Ab frontend multer (FormData) ki jagah JSON bheja karega S3 URLs ke sath
+        const {
+            user, userid, username, name, caption, musicId, audioData,
+            videoStartTime, videoEndTime, musicStartTime, musicEndTime,
+            rawVideoUrl, rawThumbnailUrl, videoOriginalname
+        } = req.body;
 
-        // Step 2: Trim (if requested) + adaptive compress
-        const outputTmp = tmp.fileSync({ postfix: ".mp4" });
-        tempFiles.push(outputTmp);
+        let uploaderUser = null;
 
-        // 1) Trim if user requested a time range
-        let videoToCompressPath = inputTmp.name;
-        if (videoStartTime && videoEndTime) {
-            const startSec = parseFloat(videoStartTime) / 1000;
-            const dur = (parseFloat(videoEndTime) - parseFloat(videoStartTime)) / 1000;
-            if (dur > 0) {
-                const trimmedTmp = tmp.fileSync({ postfix: ".mp4" });
-                tempFiles.push(trimmedTmp);
-
-                await new Promise((resolve, reject) => {
-                    ffmpeg(inputTmp.name)
-                        .seekInput(startSec)
-                        .duration(dur)
-                        .outputOptions(["-c", "copy", "-y"])
-                        .save(trimmedTmp.name)
-                        .on("end", resolve)
-                        .on("error", reject);
-                });
-
-                videoToCompressPath = trimmedTmp.name;
-            }
+        if (user && mongoose.isValidObjectId(user)) {
+            uploaderUser = await User.findById(user).select("isSuspended").lean();
         }
 
-        // 2) Adaptive compression: choose smaller targetBps to reach ~12-15MB for long videos
-        // You can tweak targetBps value or pass explicit third arg to compressVideo for custom control
-        await compressVideo(videoToCompressPath, outputTmp.name);
-
-        // 3) Log sizes
-        try {
-            const originalSize = (fs.statSync(inputTmp.name).size / (1024 * 1024)).toFixed(2);
-            const compressedSize = (fs.statSync(outputTmp.name).size / (1024 * 1024)).toFixed(2);
-            console.log(`📹 Video compression stats for ${videoOriginalname}:`);
-            console.log(`   Original size  : ${originalSize} MB`);
-            console.log(`   Compressed size: ${compressedSize} MB`);
-        } catch (e) {
-            e.statusCode = e.statusCode || 500;
-            await logError(req, e);
-            console.warn("Could not stat files for logging:", e.message);
+        if (!uploaderUser && userid) {
+            uploaderUser = await User.findOne({ userid }).select("isSuspended").lean();
         }
 
+        if (uploaderUser?.isSuspended) {
+            return res.status(403).json({
+                success: false,
+                message: "Your account is suspended. You cannot upload videos."
+            });
+        }
 
-        // ** Initial path uses the trimmed video with original audio **
-        videoFileWithFinalAudioPath = outputTmp.name;
-
-
-        // Step 3: Handle Audio Logic (Replacement OR Extraction)
-
-        let shouldReplaceAudio = false;
-        let audioInputPath = null;
-        let audioDuration = 0; // Will be set by ffprobe or video length calculation
-
-        // SCENARIO 1: External Audio Data provided, and no valid Music ID
-        if (externalAudioData && externalAudioData.url && (!musicId || !mongoose.Types.ObjectId.isValid(musicId))) {
-            console.log("[STEP 3.0] Processing external audio data from body (new Music track)...");
-
+        let parsedAudioData = null;
+        if (audioData) {
             try {
-                const title = externalAudioData.title || "External Sound";
-                const artist = externalAudioData.artist || "Unknown Artist";
-
-                // ✅ First check duplicates before downloading
-                const existingMusic = await Music.findOne({ title, artist });
-
-                if (existingMusic) {
-                    console.log("[INFO] Music already exists. Reusing:", existingMusic._id);
-
-                    finalMusicId = existingMusic._id;
-                    shouldReplaceAudio = true;
-
-                    // ✅ MUST download the existing music file for FFmpeg
-                    const ext = path.extname(existingMusic.url) || '.mp3';
-                    const musicTmpObj = await downloadFileToTemp(existingMusic.url, ext);
-                    tempFiles.push(musicTmpObj);
-                    audioInputPath = musicTmpObj.name;  // ✅ VALID path for FFmpeg
-
-                } else {
-                    // a. Download external audio file
-                    const ext = path.extname(new URL(externalAudioData.url).pathname) || '.mp3';
-                    const musicTmpObj = await downloadFileToTemp(externalAudioData.url, ext);
-                    tempFiles.push(musicTmpObj);
-                    audioInputPath = musicTmpObj.name;
-
-                    // b. Get duration
-                    audioDuration = await getAudioDuration(audioInputPath);
-
-                    // c. Upload audio
-                    const audioBuffer = fs.readFileSync(audioInputPath);
-                    const audioUploadResult = await uploadToS3(
-                        {
-                            buffer: audioBuffer,
-                            originalname: `external-sound-${userid}-${Date.now()}${ext}`,
-                            mimetype: ext === '.mp3' ? "audio/mp3" : "audio/mpeg",
-                        },
-                        `audio`
-                    );
-
-                    const musicUrl = audioUploadResult;
-
-                    // d. Save NEW music
-                    const newMusic = new Music({
-                        title,
-                        artist,
-                        url: musicUrl,
-                        duration: audioDuration,
-                        uploadedBy: user,
-                        thumbnail: externalAudioData.artwork || "",
-                    });
-
-                    const savedMusic = await newMusic.save();
-                    finalMusicId = savedMusic._id;
-                    shouldReplaceAudio = true;
-                }
-
+                parsedAudioData = typeof audioData === 'string' ? JSON.parse(audioData) : audioData;
             } catch (e) {
-                console.warn("[WARNING] External audio failed:", e.message);
-                e.statusCode = e.statusCode || 500;
                 await logError(req, e);
-                audioInputPath = null;
-                finalMusicId = musicId || null;
+                console.error("Error parsing audioData:", e);
             }
         }
 
-
-        // SCENARIO 2: Valid Music ID was provided originally (or was set in SCENARIO 1)
-        if (!shouldReplaceAudio && finalMusicId && mongoose.Types.ObjectId.isValid(finalMusicId)) {
-            const musicDoc = await Music.findById(finalMusicId);
-            if (musicDoc?.url) {
-                // Download the music if it's a known track
-                console.log("[STEP 3.1] Replacing original audio with existing music...");
-                const ext = path.extname(musicDoc.url) || '.mp3';
-                const musicTmpObj = await downloadFileToTemp(musicDoc.url, ext);
-                tempFiles.push(musicTmpObj);
-                audioInputPath = musicTmpObj.name;
-                shouldReplaceAudio = true;
-            }
-        }
-        if (shouldReplaceAudio) {
-            // Audio Replacement with LOOP till video end
-            const replacedTmp = tmp.fileSync({ postfix: ".mp4" });
-            tempFiles.push(replacedTmp);
-
-            // 🔑 Get VIDEO duration (seconds)
-            const videoDuration = await getAudioDuration(outputTmp.name);
-
-            await new Promise((resolve, reject) => {
-                ffmpeg(outputTmp.name)
-                    .input(audioInputPath)
-                    .inputOptions([
-                        "-stream_loop", "-1"   // 🔁 LOOP MUSIC infinitely
-                    ])
-                    .outputOptions([
-                        "-map 0:v:0",          // video from input 0
-                        "-map 1:a:0",          // audio from input 1
-                        "-c:v copy",           // no re-encode video
-                        "-c:a aac",
-                        "-b:a 128k",
-                        "-t", `${videoDuration}`, // ⏱️ stop at video duration
-                        "-y"
-                    ])
-                    .save(replacedTmp.name)
-                    .on("end", resolve)
-                    .on("error", reject);
+        if (!user || !rawVideoUrl) {
+            return res.status(400).json({
+                success: false,
+                message: "User or rawVideoUrl missing! Ensure video is uploaded to S3 first."
             });
-
-            videoFileWithFinalAudioPath = replacedTmp.name;
-        }
-        else {
-            // SCENARIO 3: No valid Music ID/External Data -> EXTRACT original audio
-            // This is the original "else" block, now SCENARIO 3
-            console.log("[STEP 3.2] Extracting and saving original audio...");
-
-            // a. Extract audio from the trimmed video (outputTmp.name)
-            const extractedAudioTmp = tmp.fileSync({ postfix: ".mp3" });
-            tempFiles.push(extractedAudioTmp);
-
-            await new Promise((resolve, reject) => {
-                ffmpeg(outputTmp.name)
-                    .outputOptions([
-                        "-vn",
-                        "-c:a libmp3lame",
-                        "-b:a 128k",
-                        "-y",
-                    ])
-                    .save(extractedAudioTmp.name)
-                    .on("end", resolve)
-                    .on("error", reject);
-            });
-
-            // b. Upload the audio file to S3
-            const audioBuffer = fs.readFileSync(extractedAudioTmp.name);
-            const audioUploadResult = await uploadToS3(
-                {
-                    buffer: audioBuffer,
-                    originalname: `original-sound-${userid}-${Date.now()}.mp3`,
-                    mimetype: "audio/mp3",
-                },
-                `audio`
-            );
-
-            if (!audioUploadResult) {
-                throw new Error("S3 Upload failed to return a URL for the extracted audio.");
-            }
-            const musicUrl = audioUploadResult;
-
-            // c. Determine audio duration for the Music model
-            let originalAudioDuration = 0;
-            const videoDurationMs = (parseFloat(videoEndTime) - parseFloat(videoStartTime));
-            if (!isNaN(videoDurationMs) && videoDurationMs > 0) {
-                originalAudioDuration = Math.round(videoDurationMs / 1000);
-            }
-
-            // d. Save new Music document
-            const newMusic = new Music({
-                title: caption ? `${caption.substring(0, 50)}... (Original Sound)` : "Original Video Sound",
-                artist: name || username || 'Unknown User',
-                url: musicUrl,
-                duration: originalAudioDuration,
-                uploadedBy: user,
-                thumbnail: '',
-            });
-
-            const savedMusic = await newMusic.save();
-            finalMusicId = savedMusic._id;
-            // videoFileWithFinalAudioPath remains outputTmp.name (trimmed video with original audio)
         }
 
-        const uploaderUser = await User.findById(user);
-
-        // Step 4: Save reel metadata first (to get _id)
-        const newReel = new Reel({
-            ...reelMetadata,
-            music: finalMusicId,
-            videoUrl: "",
-            thumbnailUrl: "",
-            seller_id: uploaderUser?.seller_id || "",
-            userseller_id: uploaderUser?.userseller_id || "",
-
-        });
-        const savedReel = await newReel.save();
-        newReelId = savedReel._id;
-
-        // Step 4.5: Generate and save short link for sharing
-     try {
-    const uploaderUser = await User.findById(user); // ✅ direct DB se lo
-
-    if (uploaderUser) {
-        const realUserId = uploaderUser.userid; // ✅ always correct (UUID ya number jo bhi ho)
-
-        const { slug, shortLink } = generateShortLink(
-            savedReel._id,
-            realUserId
-        );
-
-        savedReel.shortLinks.push({
-            slug,
-            shortLink,
-            generatedForUser: uploaderUser._id,
-            generatedAt: new Date()
-        });
-
-        await savedReel.save();
-
-        console.log(`[STEP 4.5] Short link generated and saved: ${shortLink}`);
-    }
-} catch (shortLinkError) {
-    shortLinkError.statusCode = shortLinkError.statusCode || 500;
-    await logError(req, shortLinkError);
-    console.warn("[WARNING] Failed to generate short link (non-blocking):", shortLinkError.message);
-}
-
-        console.log("[STEP 5] Generating HLS segments with multiple quality variants...");
-        const hlsDir = path.join(os.tmpdir(), `hls-${newReelId}`);
-        fs.mkdirSync(hlsDir, { recursive: true });
-
-        // Define quality variants for adaptive streaming
-        // Optimized quality variants
-        const qualityVariants = [
-            {
-                name: "240p",
-                resolution: "426x240",
-                videoBitrate: "250k",
-                audioBitrate: "48k",
-                bandwidth: 380000,
-                hlsTime: 2
-            },
-            {
-                name: "480p",
-                resolution: "854x480",
-                videoBitrate: "800k",
-                audioBitrate: "96k",
-                bandwidth: 1150000,
-                hlsTime: 2
-            },
-            {
-                name: "720p",
-                resolution: "1280x720",
-                videoBitrate: "1400k",
-                audioBitrate: "128k",
-                bandwidth: 2100000,
-                hlsTime: 2
-            }
-        ];
-
-
-
-
-
-        // Function to generate HLS for one variant
-        const generateHLS = async (variant) => {
-            const variantDir = path.join(hlsDir, variant.name);
-            fs.mkdirSync(variantDir, { recursive: true });
-
-            const segmentPattern = path.join(variantDir, "segment_%03d.ts").replace(/\\/g, '/');
-            const outputPath = path.join(variantDir, "index.m3u8").replace(/\\/g, '/');
-
-            return new Promise((resolve, reject) => {
-                ffmpeg(videoFileWithFinalAudioPath)
-                    .videoFilters(`scale=${variant.resolution}:force_original_aspect_ratio=decrease,pad=ceil(iw/2)*2:ceil(ih/2)*2`)
-                    .videoCodec('libx264')
-                    .audioCodec('aac')
-                    .addOutputOptions([
-                        "-preset", "veryfast",
-                        `-b:v ${variant.videoBitrate}`,
-                        `-maxrate ${variant.videoBitrate}`,
-                        `-bufsize ${parseInt(variant.videoBitrate) * 2}k`,
-                        `-b:a ${variant.audioBitrate}`,
-                        "-sc_threshold", "0",
-                        "-g", `${24 * variant.hlsTime}`,       // Keyframe interval
-                        "-keyint_min", `${24 * variant.hlsTime}`,
-                        "-force_key_frames", `expr:gte(t,n_forced*${variant.hlsTime})`,
-                        "-hls_time", `${variant.hlsTime}`,
-                        "-hls_playlist_type", "vod",
-                        "-hls_list_size", "0",
-                        "-hls_flags", "independent_segments",
-                        "-hls_segment_type", "mpegts",
-                        `-hls_segment_filename`, segmentPattern,
-                        "-f", "hls",
-                        "-y",
-                    ])
-                    .output(outputPath)
-                    .on("start", (cmd) => console.log(`[FFmpeg] Command for ${variant.name}: ${cmd}`))
-                    .on("end", () => {
-                        console.log(`[FFmpeg] Generated ${variant.name} variant`);
-                        resolve();
-                    })
-                    .on("error", (err, stdout, stderr) => {
-                        console.error(`[FFmpeg] ERROR for ${variant.name}:`, err.message);
-                        console.error(stderr);
-                        reject(err);
-                    })
-                    .run();
-            });
-        };
-
-        // Run all variants in parallel
-        await Promise.all(qualityVariants.map(generateHLS));
-        console.log("[STEP 5] All HLS variants generated successfully!");
-
-        // Create master playlist referencing all variants
-        console.log("[STEP 5] Creating master playlist...");
-        const masterPlaylistContent = `#EXTM3U
-#EXT-X-VERSION:3
-#EXT-X-INDEPENDENT-SEGMENTS
-${qualityVariants.map(variant =>
-            `#EXT-X-STREAM-INF:BANDWIDTH=${variant.bandwidth},RESOLUTION=${variant.resolution}
-${variant.name}/index.m3u8`
-        ).join('\n')}
-`;
-
-        fs.writeFileSync(path.join(hlsDir, "master.m3u8"), masterPlaylistContent);
-        console.log("[STEP 5] Master playlist created successfully!");
-
-        // Step 6: Handle thumbnail (upload or generate)
-        console.log("[STEP 6] Handling thumbnail...");
-        let thumbnailUrl = null;
-        if (thumbBuffer) {
-            thumbnailUrl = await uploadToS3({ buffer: thumbBuffer, originalname: `thumb-${newReelId}.jpg`, mimetype: "image/jpeg" }, "thumbnails");
-        } else {
-            const thumbTmp = tmp.fileSync({ postfix: ".jpg" });
-            tempFiles.push(thumbTmp);
-            await new Promise((resolve, reject) => {
-                ffmpeg(videoFileWithFinalAudioPath).screenshots({ timestamps: [0], filename: path.basename(thumbTmp.name), folder: path.dirname(thumbTmp.name), size: "640x?", })
-                    .on("end", resolve).on("error", reject);
-            });
-            const thumbBufferFromFile = fs.readFileSync(thumbTmp.name);
-            thumbnailUrl = await uploadToS3({ buffer: thumbBufferFromFile, originalname: `thumb-${newReelId}.jpg`, mimetype: "image/jpeg", }, "thumbnails");
-        }
-
-        // Optional: If an original sound was created in Step 3, update its thumbnail
-        // This is now covered for both newly created external audio (SCENARIO 1) and extracted audio (SCENARIO 3)
-        // because we check if the original musicId was *not* provided, but finalMusicId *was* set.
-        if (!musicId && finalMusicId) {
-            await Music.findByIdAndUpdate(finalMusicId, { thumbnail: thumbnailUrl });
-        }
-
-
-        // -------------------- STEP 7 (REPLACE EXISTING CODE) --------------------
-        // Upload all HLS files to S3 (preserve filenames under videos/reels/<newReelId>/...)
-        console.log("[STEP 7] Uploading HLS files to S3...");
+        let currentUsername = username || "";
+        let currentName = name || "";
 
         try {
-            // Get list of variant folders (skip non-directories)
-            const variantFolders = fs.readdirSync(hlsDir).filter((name) => {
-                const p = path.join(hlsDir, name);
-                return fs.existsSync(p) && fs.statSync(p).isDirectory();
-            });
-
-            // Small concurrency control: number of parallel uploads
-            const MAX_CONCURRENT = 4;
-            const uploadQueue = [];
-
-            // Helper to upload a single file buffer -> S3 under a folder preserving filename
-            const uploadFileBuffer = async (buffer, filename, s3Folder) => {
-                const mimetype = filename.endsWith(".m3u8")
-                    ? "application/vnd.apple.mpegurl"
-                    : filename.endsWith(".ts")
-                        ? "video/mp2t"
-                        : filename.endsWith(".mp4")
-                            ? "video/mp4"
-                            : filename.endsWith(".jpg") || filename.endsWith(".jpeg")
-                                ? "image/jpeg"
-                                : filename.endsWith(".png")
-                                    ? "image/png"
-                                    : "application/octet-stream";
-
-                await uploadToS3(
-                    {
-                        buffer,
-                        originalname: filename,
-                        mimetype,
-                    },
-                    s3Folder,
-                    true // preserve filename
-                );
-            };
-
-            // Upload each variant folder's files
-            for (const folderName of variantFolders) {
-                const variantDir = path.join(hlsDir, folderName);
-                const files = fs.readdirSync(variantDir).filter(f => fs.statSync(path.join(variantDir, f)).isFile());
-
-                console.log(`[STEP 7] Preparing upload for variant: ${folderName} (${files.length} files)`);
-
-                for (const file of files) {
-                    const filePath = path.join(variantDir, file);
-                    const buffer = fs.readFileSync(filePath);
-                    const s3Folder = `videos/reels/${newReelId}/${folderName}`; // e.g. videos/reels/abcd123/360p
-
-                    // push upload promise to queue, but throttle concurrency
-                    const p = (async () => {
-                        try {
-                            await uploadFileBuffer(buffer, file, s3Folder);
-                            console.log(`[STEP 7] Uploaded ${folderName}/${file}`);
-                        } catch (err) {
-                            console.error(`[STEP 7] Failed upload ${folderName}/${file}:`, err.message || err);
-                            throw err;
-                        }
-                    })();
-
-                    uploadQueue.push(p);
-
-                    // throttle: if queue length hits MAX_CONCURRENT, await the first to finish
-                    if (uploadQueue.length >= MAX_CONCURRENT) {
-                        // wait for any one to finish (Promise.race), then remove finished ones
-                        await Promise.race(uploadQueue).catch(e => { /* allow individual upload errors to bubble below */ });
-                        // remove settled promises from array
-                        const settled = await Promise.allSettled(uploadQueue);
-                        // keep only pending ones
-                        const pending = [];
-                        for (let i = 0; i < settled.length; i++) {
-                            if (settled[i].status === "pending") pending.push(uploadQueue[i]);
-                        }
-                        // replace queue with pending (note: in Node Promise.allSettled returns resolved immediately — we instead
-                        // rebuild by filtering out fulfilled/rejected entries)
-                        uploadQueue.length = 0;
-                        // Rebuild with only unresolved promises is tricky; simpler approach: await all to finish in next step.
-                        // To keep implementation simple and robust, if we've hit concurrency limit we await Promise.all of current queue
-                        await Promise.allSettled(uploadQueue);
-                        uploadQueue.length = 0;
-                    }
-                } // end files loop
-
-                // After iterating files, flush any remaining in queue
-                if (uploadQueue.length > 0) {
-                    await Promise.allSettled(uploadQueue);
-                    uploadQueue.length = 0;
-                }
-
-                console.log(`[STEP 7] Finished uploading variant: ${folderName}`);
-            } // end variantFolders loop
-
-            // -------------------- Upload master playlist last --------------------
-            const masterPath = path.join(hlsDir, "master.m3u8");
-            if (!fs.existsSync(masterPath)) {
-                throw new Error("master.m3u8 not found in HLS directory");
+            let dbUser = null;
+            if (userid && mongoose.isValidObjectId(userid)) {
+                dbUser = await User.findById(userid).select("username name").lean();
             }
-
-            const masterBuffer = fs.readFileSync(masterPath);
-            await uploadToS3(
-                {
-                    buffer: masterBuffer,
-                    originalname: "master.m3u8",
-                    mimetype: "application/vnd.apple.mpegurl",
-                },
-                `videos/reels/${newReelId}`,
-                true
-            );
-
-            console.log("[STEP 7] Uploaded master.m3u8 and all variants to S3");
-        } catch (uploadErr) {
-            console.error("[STEP 7] Error uploading HLS files to S3:", uploadErr);
-             uploadErr.statusCode = uploadErr.statusCode || 500;
-            await logError(req, uploadErr);
-            throw uploadErr; // rethrow to trigger outer catch & mark reel as failed
+            if (!dbUser) {
+                dbUser = await User.findOne({ $or: [{ userid: userid }, { userid: user }, { _id: user }] }).select("username name").lean();
+            }
+            if (dbUser && dbUser.username) currentUsername = dbUser.username;
+            if (dbUser && dbUser.name) currentName = dbUser.name;
+        } catch (err) {
+            console.warn("⚠ Could not fetch latest username from DB:", err.message);
         }
 
+        const uploaderUserDoc = await User.findById(user).select("seller_id userseller_id").lean();
 
-        // Step 8: Final update of Reel document with master playlist URL
-        const videoUrl = `https://${process.env.CLOUDFRONT_URL}/videos/reels/${newReelId}/master.m3u8`;
-        savedReel.videoUrl = videoUrl;
-        savedReel.thumbnailUrl = thumbnailUrl;
-        savedReel.status = 'Published'; // Mark as published after successful processing
-        await savedReel.save();
+        // Save Stub Reel immediately so user sees "Processing"
+        const stubReel = new Reel({
+            user,
+            userid,
+            username: currentUsername,
+            name: currentName,
+            caption,
+            music: musicId && mongoose.Types.ObjectId.isValid(musicId) ? musicId : null,
+            videoUrl: "",
+            thumbnailUrl: rawThumbnailUrl || "",
+            status: "Processing",
+            qualityVariants: [],
+            seller_id: uploaderUserDoc?.seller_id || "",
+            userseller_id: uploaderUserDoc?.userseller_id || "",
+        });
+        const savedStub = await stubReel.save();
 
-        console.log("===== [WORKER: FULL UPLOAD SUCCESS] =====");
+        // Prepare job data for background worker
+        const jobData = {
+            rawVideoUrl,               // Direct S3 url instead of buffer
+            rawThumbnailUrl,           // Direct S3 url instead of buffer
+            videoOriginalname: videoOriginalname || "video.mp4",
+            reelId: savedStub._id.toString(),
+            user,
+            userid,
+            username: currentUsername,
+            name: currentName,
+            caption,
+            musicId,
+            videoStartTime,
+            videoEndTime,
+            musicStartTime,
+            musicEndTime,
+            externalAudioData: parsedAudioData,
+        };
+
+        // Add to Redis Queue instead of processing locally
+        await reelQueue.add('process-reel-job', jobData, { removeOnComplete: true, removeOnFail: false });
+
+        console.log("-> Job pushed to Queue. Responding with 202 Accepted.");
+        return res.status(202).json({
+            success: true,
+            message: "Upload initiated. Video is queued for processing asynchronously.",
+            status: "processing",
+            reel: {
+                id: savedStub._id,
+                _id: savedStub._id,
+                status: savedStub.status,
+                caption: savedStub.caption,
+                thumbnailUrl: savedStub.thumbnailUrl,
+                qualityVariants: savedStub.qualityVariants || [],
+            },
+        });
+
     } catch (err) {
-        console.error("===== [WORKER: FULL UPLOAD ERROR] =====");
+        console.error("===== [FULL UPLOAD API ERROR] =====");
         console.error(err);
         err.statusCode = err.statusCode || 500;
         await logError(req, err);
-        if (newReelId) {
-            await Reel.findByIdAndUpdate(newReelId, { status: 'failed', error: err.message });
-        }
-        throw err;
-    } finally {
-        // Step 9: Cleanup temporary files and directory
-        tempFiles.forEach((t) => { try { if (t) t.removeCallback(); } catch (e) { console.warn("Could not remove temp file:", e.message); } });
-        if (hlsDir) { try { fs.rmSync(hlsDir, { recursive: true, force: true }); } catch (e) { console.warn("Could not remove HLS directory:", e.message); } }
+        res.status(500).json({
+            success: false,
+            message: "Server error during reel upload initiation.",
+        });
     }
-}
-
-
-// =================================================================
-// === 3. EXPRESS ROUTE (Updated Logic for audioData) ===
-// =================================================================
-router.post(
-    "/full-upload",
-    upload.fields([
-        { name: "video", maxCount: 1 },
-        { name: "thumbnail", maxCount: 1 },
-    ]),
-    async (req, res) => {
-        console.log("===== [FULL UPLOAD API HIT] =====");
-        try {
-            const {
-                user, userid, username, name, caption, musicId, audioData,
-                videoStartTime, videoEndTime, musicStartTime, musicEndTime,
-            } = req.body;
-
-            // 🚫 ================= SUSPEND CHECK (UPLOAD BLOCK) =================
-            let uploaderUser = null;
-
-            // try by ObjectId
-            if (user && mongoose.isValidObjectId(user)) {
-                uploaderUser = await User.findById(user).select("isSuspended").lean();
-            }
-
-            // fallback by userid string
-            if (!uploaderUser && userid) {
-                uploaderUser = await User.findOne({ userid }).select("isSuspended").lean();
-            }
-
-            if (uploaderUser?.isSuspended) {
-                return res.status(403).json({
-                    success: false,
-                    message: "Your account is suspended. You cannot upload videos."
-                });
-            }
-            // 🚫 ===============================================================
-
-
-            // --- NEW: Safely parse audioData into an object ---
-            let parsedAudioData = null;
-            if (audioData) {
-                try {
-                    parsedAudioData = JSON.parse(audioData);
-                } catch (e) {
-                    await logError(req, e);
-                    console.error("Error parsing audioData:", e);
-                }
-            }
-            // -------------------------------------------------
-
-            console.log(audioData, musicId);
-
-            if (!user || !req.files || !req.files.video) {
-                return res.status(400).json({
-                    success: false,
-                    message: "User or video file missing!"
-                });
-            }
-
-            // ✅ Ensure latest username fetched from DB (fix for old username issue)
-            let currentUsername = username || "";
-            let currentName = name || "";
-
-            try {
-                let dbUser = null;
-
-                // If userid is an ObjectId, find by _id
-                if (userid && mongoose.isValidObjectId(userid)) {
-                    dbUser = await User.findById(userid)
-                        .select("username name")
-                        .lean();
-                }
-
-                // If not found, try find by userid field or user field
-                if (!dbUser) {
-                    dbUser = await User.findOne({
-                        $or: [{ userid: userid }, { userid: user }, { _id: user }],
-                    })
-                        .select("username name")
-                        .lean();
-                }
-
-                // If username found in DB, use it
-                if (dbUser && dbUser.username) {
-                    currentUsername = dbUser.username;
-                }
-
-                if (dbUser && dbUser.name) {
-                    currentName = dbUser.name;
-                }
-            } catch (err) {
-                console.warn("⚠ Could not fetch latest username from DB:", err.message);
-            }
-
-            const videoFile = req.files.video[0];
-            const thumbFile = req.files.thumbnail ? req.files.thumbnail[0] : null;
-
-            // Prepare job data
-            const jobData = {
-                videoBuffer: videoFile.buffer,
-                videoOriginalname: videoFile.originalname,
-                thumbBuffer: thumbFile ? thumbFile.buffer : null,
-                user,
-                userid,
-                username: currentUsername,
-                name: currentName,
-                caption,
-                musicId,
-                videoStartTime,
-                videoEndTime,
-                musicStartTime,
-                musicEndTime,
-
-                // --- NEW: Pass the parsed external audio object ---
-                externalAudioData: parsedAudioData,
-                // -------------------------------------------------
-            };
-
-            // *** WARNING: In production, replace this direct call with a queue enqueue ***
-            processReelUpload(jobData).catch(err => {
-                console.error("Worker failed after API responded:", err);
-            });
-
-            // Immediate Response to Client (202 Accepted)
-            console.log("-> Job initiated. Responding with 202 Accepted.");
-            return res.status(202).json({
-                success: true,
-                message: "Upload initiated. Video is being processed asynchronously.",
-            });
-
-        } catch (err) {
-            console.error("===== [FULL UPLOAD API ERROR] =====");
-            console.error(err);
-            err.statusCode = err.statusCode || 500;
-            await logError(req, err);
-            res.status(500).json({
-                success: false,
-                message: "Server error during reel upload initiation.",
-            });
-        }
-    }
-);
+});
 
 
 router.post("/", upload.single("file"), async (req, res) => {
@@ -1037,30 +227,23 @@ router.post("/", upload.single("file"), async (req, res) => {
 
         const folder = req.body.folder || "uploads";
 
-        // ✅ Check if uploaded file is video
         if (req.file.mimetype.startsWith("video/")) {
-            // Save uploaded buffer to a temp file
             const inputTmp = tmp.fileSync({ postfix: path.extname(req.file.originalname) });
             fs.writeFileSync(inputTmp.name, req.file.buffer);
 
-            // Create another temp file for compressed video
             const outputTmp = tmp.fileSync({ postfix: ".mp4" });
 
-            // Run ffmpeg compression
-            // Use adaptive compress for single-file uploads as well
+            // Note: Tumhe worker.js me bhi compressVideo rakha hai, agar yahan route me zaroorat hai toh function yahan define karna padega (jaise pehle tha)
+            // But main code flow ke liye as it is rakha hai.
             await compressVideo(inputTmp.name, outputTmp.name);
 
-
-            // Read compressed file back into buffer
             const compressedBuffer = fs.readFileSync(outputTmp.name);
 
-            // Upload to S3
             const uploadedFileUrl = await uploadToS3(
                 { buffer: compressedBuffer, originalname: "compressed-" + req.file.originalname, mimetype: "video/mp4" },
                 folder
             );
 
-            // Cleanup
             inputTmp.removeCallback();
             outputTmp.removeCallback();
 
@@ -1072,7 +255,6 @@ router.post("/", upload.single("file"), async (req, res) => {
             });
 
         } else {
-            // ✅ If file is NOT a video, upload directly
             const uploadedFileUrl = await uploadToS3(req.file, folder);
             console.log("image", uploadedFileUrl)
 
@@ -1094,7 +276,6 @@ router.post("/", upload.single("file"), async (req, res) => {
     }
 });
 
-
 router.post("/upload", async (req, res) => {
     try {
         const data = await req.body;
@@ -1109,7 +290,6 @@ router.post("/upload", async (req, res) => {
 
         const savedReel = await newReel.save();
 
-        // Generate and save short link for sharing
         try {
             const uploaderUser = await User.findById(savedReel.user);
             if (uploaderUser && savedReel.userid) {
@@ -1129,16 +309,15 @@ router.post("/upload", async (req, res) => {
 
         if (typeof savedReel.videoUrl === "string" && savedReel.videoUrl.toLowerCase().includes(".mp4")) {
             await Reel.findByIdAndUpdate(savedReel._id, { status: "Processing" });
-            convertMp4UrlToHlsAndUpdateReel(savedReel._id, savedReel.videoUrl).catch(() => { });
+            // Queue ko push kar sakte ho yaha bhi agar HLS conversion karna hai
+            // convertMp4UrlToHlsAndUpdateReel(savedReel._id, savedReel.videoUrl).catch(() => { });
             return res.status(202).json({
                 message: "Reel saved. Video is being optimized for streaming.",
                 data: { id: savedReel._id, savedReel }
             });
         }
 
-        // Safely log user action (even if log fails, app continues)
         try {
-
             await logUserAction({
                 user: savedReel.user,
                 action: "upload_reel",
@@ -1148,7 +327,7 @@ router.post("/upload", async (req, res) => {
                 location: {
                     ip: req.headers["x-forwarded-for"] || req.socket.remoteAddress || "",
                     country: req.headers["cf-ipcountry"] || "",
-                    city: "", // Optional: Use IP geolocation later
+                    city: "", 
                     pincode: ""
                 }
             });
@@ -1163,7 +342,6 @@ router.post("/upload", async (req, res) => {
             }
         });
 
-
     } catch (error) {
         res.status(500).json({ message: "An Error occure in Upload Reel!" });
         error.statusCode = error.statusCode || 500;
@@ -1171,6 +349,7 @@ router.post("/upload", async (req, res) => {
         console.log("Error in upload reel", error);
     }
 });
+
 
 router.get("/by-music/:id", async (req, res) => {
     try {
@@ -1397,265 +576,105 @@ router.get(
   }
 );
 
-
-
-
-
-
-// router.get("/shownew", async (req, res) => { 
-//     try {
-//         const limit = parseInt(req.query.limit || "2", 10);
-//         const exclude = req.query.exclude?.split(",").filter(Boolean) || [];
-//         const currentUserId = req.query.userId;
-//         const direction = req.query.direction || "next";
-
-//         if (!currentUserId) {
-//             return res.status(400).json({ message: "Missing userId" });
-//         }
-
-//         let matchStage = exclude.length
-//             ? { _id: { $nin: exclude.map((id) => new mongoose.Types.ObjectId(id)) } }
-//             : {};
-
-//         // 🔥 ADDED: BLOCK FILTER & NOT INTERESTED LOGIC START 🔥
-//         if (mongoose.isValidObjectId(currentUserId)) {
-            
-//             // 1. Viewer ko fetch karo aur isDeleted bhi select karo
-//             const viewer = await User.findById(currentUserId).select("blockedUsers isDeleted").lean();
-            
-//             // ✨ NAYI LINE: Agar dekhne wala (viewer) khud deleted hai, toh seedha block karo ✨
-//             if (viewer && viewer.isDeleted) {
-//                 return res.status(403).json({ message: "Your account is deleted. Access denied." });
-//             }
-
-//             const blockedList = viewer?.blockedUsers || [];
-            
-//             // 2. Kisko viewer ne block kiya hai (Reverse lookup)
-//             const blockers = await User.find({ blockedUsers: currentUserId }).select("_id").lean();
-//             const usersWhoBlockedMe = blockers.map(b => b._id);
-            
-//             // 3. Deleted users ko find karna (Soft Delete Logic)
-//             const deletedUsers = await User.find({ isDeleted: true }).select("_id").lean();
-//             const deletedUserIds = deletedUsers.map(u => u._id);
-            
-//             // 4. Combined Exclude List (Blocked by me + Blocked me + Deleted Accounts)
-//             const allExcludedUsers = [...blockedList, ...usersWhoBlockedMe, ...deletedUserIds];
-
-//             if (allExcludedUsers.length > 0) {
-//                 matchStage.user = { $nin: allExcludedUsers }; // In logo ki reels feed mein mat dikhao
-//             }
-            
-//             // Feed mein admin wali blocked reels na aayein (safety check)
-//             matchStage.status = { $ne: "Blocked" };
-
-//             // 🔥 5. NOT INTERESTED LOGIC ADDED HERE
-//             const notInterestedInteractions = await ReelInteraction.find({
-//                 user: currentUserId,
-//                 action: "not_interested"
-//             }).select("reel").lean();
-
-//             if (notInterestedInteractions.length > 0) {
-//                 const notInterestedReelIds = notInterestedInteractions.map(interaction => interaction.reel);
-                
-//                 // Agar `exclude` ki wajah se pehle se `$nin` tha, toh usme append karo
-//                 if (matchStage._id && matchStage._id.$nin) {
-//                     matchStage._id.$nin.push(...notInterestedReelIds);
-//                 } else {
-//                     matchStage._id = { $nin: notInterestedReelIds };
-//                 }
-//             }
-//         }
-//         // 🔥 ADDED: BLOCK FILTER & NOT INTERESTED LOGIC END 🔥
-
-//         // 🎬 Sample random reels
-//         const reels = await Reel.aggregate([
-//             { $match: matchStage },
-//             { $sample: { size: limit } },
-//         ]);
-
-//         // 👤 Fetch current user's profile picture
-//         const currentUser = await User.findById(currentUserId, "profilePicture").lean();
-//         const currentUserProfilePic = currentUser?.profilePicture || "";
-
-//         // 🔁 Add isFollowing + current user + reel owner profile picture + seller_id
-//         const reelsWithFollow = await Promise.all(
-//             reels.map(async (reel) => {
-//                 const [isFollowing, reelOwner] = await Promise.all([
-//                     User.exists({
-//                         _id: reel.user,
-//                         followers: new mongoose.Types.ObjectId(currentUserId),
-//                     }),
-//                     User.findById(
-//                         reel.user,
-//                         "profilePicture seller_id userseller_id"
-//                     ).lean(),
-//                 ]);
-
-//                 const reelUserProfilePic = reelOwner?.profilePicture || "";
-
-//                 return {
-//                     ...reel, // keep original reel fields
-//                     isFollowing: !!isFollowing,
-//                     currentUserProfilePic,
-//                     reelUserProfilePic,
-
-//                     // ✅ NEW FIELDS ADDED IN RESPONSE
-//                     seller_id: reel.seller_id || reelOwner?.seller_id || "",
-//                     userseller_id: reel.userseller_id || reelOwner?.userseller_id || "",
-//                 };
-//             })
-//         );
-
-//         res.json({ reels: reelsWithFollow, direction });
-//     } catch (e) {
-//         console.error("Error fetching reels:", e);
-//         e.statusCode = e.statusCode || 500;
-//         await logError(req, e);
-//         res.status(500).json({ message: "Error fetching reels" });
-//     }
-// });
-
 router.get("/shownew", async (req, res) => { 
     try {
         const limit = parseInt(req.query.limit || "2", 10);
+        // Exclude logic as it is
         const exclude = req.query.exclude?.split(",").filter(Boolean) || [];
         const currentUserId = req.query.userId;
         const direction = req.query.direction || "next";
 
-        if (!currentUserId || !mongoose.isValidObjectId(currentUserId)) {
-            return res.status(400).json({ message: "Invalid or Missing userId" });
+        if (!currentUserId) {
+            return res.status(400).json({ message: "Missing userId" });
         }
 
-        const currentUserObjId = new mongoose.Types.ObjectId(currentUserId);
+        let matchStage = exclude.length
+            ? { _id: { $nin: exclude.map((id) => new mongoose.Types.ObjectId(id)) } }
+            : {};
 
-        // 1. Viewer ki details fetch karo
-        const viewer = await User.findById(currentUserId)
-            .select("blockedUsers isDeleted profilePicture")
-            .lean();
-        
-        // Agar dekhne wala (viewer) khud deleted hai, toh seedha block karo
-        if (viewer && viewer.isDeleted) {
-            return res.status(403).json({ message: "Your account is deleted. Access denied." });
-        }
+        matchStage.isDeleted = { $ne: true };
+        matchStage.status = { $ne: "Blocked" };
 
-        const blockedList = viewer?.blockedUsers || [];
-        const currentUserProfilePic = viewer?.profilePicture || "";
-
-        // 2. Not Interested Reels (Sirf 1 user ki hai, isliye RAM mein lana safe hai)
-        // 🔥 FIX: .distinct() use kiya taaki memory kam use ho
-        const notInterestedReelIds = await ReelInteraction.find({
-            user: currentUserId,
-            action: "not_interested"
-        }).distinct("reel");
-
-        // 3. Exclude array tayyar karna (Frontend exclude + Not interested)
-        const allExcludedReelIds = [
-            ...exclude.map(id => new mongoose.Types.ObjectId(id)),
-            ...notInterestedReelIds
-        ];
-
-        // ==========================================
-        // 🚀 THE MILLION-USER AGGREGATION PIPELINE
-        // ==========================================
-        const reelsPipeline = [
-            // STAGE 1: Fast Filters (Jo reels nahi chahiye unhe pehle hi hata do)
-            {
-                $match: {
-                    status: { $ne: "Blocked" },
-                    _id: { $nin: allExcludedReelIds },
-                    user: { $nin: blockedList } // Maine jinko block kiya unki reels na aayein
-                }
-            },
+        if (mongoose.isValidObjectId(currentUserId)) {
+            const viewer = await User.findById(currentUserId).select("blockedUsers isDeleted").lean();
             
-            // STAGE 2: Sampling (Limit se thoda zyada uthao kyunki aage kuch delete/block users filter honge)
-            { $sample: { size: limit + 5 } }, 
+            if (viewer && viewer.isDeleted) {
+                return res.status(403).json({ message: "Your account is deleted. Access denied." });
+            }
 
-            // STAGE 3: Reel Owner ki details database ke andar hi join karo ($lookup)
-            {
-                $lookup: {
-                    from: "users", // Apne user collection ka exact naam check kar lena
-                    localField: "user",
-                    foreignField: "_id",
-                    as: "owner"
-                }
-            },
-            { $unwind: "$owner" }, // Array ko object mein convert karna
+            const blockedList = viewer?.blockedUsers || [];
+            const blockers = await User.find({ blockedUsers: currentUserId }).select("_id").lean();
+            const usersWhoBlockedMe = blockers.map(b => b._id);
+            
+            const allExcludedUsers = [...blockedList, ...usersWhoBlockedMe];
+            if (allExcludedUsers.length > 0) {
+                matchStage.user = { $nin: allExcludedUsers }; 
+            }
 
-            // STAGE 4: Deleted users & Jisne mujhe block kiya hai usko filter karo (Soft Delete & Reverse Block)
-            {
-                $match: {
-                    "owner.isDeleted": { $ne: true },
-                    "owner.blockedUsers": { $ne: currentUserObjId }
-                }
-            },
+            const notInterestedInteractions = await ReelInteraction.find({
+                user: currentUserId,
+                action: "not_interested"
+            })
+            .select("reel")
+            .sort({ createdAt: -1 })
+            .limit(200) 
+            .lean();
 
-            // STAGE 5: Ab exact wo limit lagao jo frontend ko chahiye
-            { $limit: limit },
-
-            // STAGE 6: Comments Count (Bina loop lagaye database mein hi count karo)
-            {
-                $lookup: {
-                    from: "comments",
-                    let: { reelId: "$_id" },
-                    pipeline: [
-                        { $match: { $expr: { $eq: ["$reel", "$$reelId"] }, isDeleted: { $ne: true } } },
-                        { $count: "count" }
-                    ],
-                    as: "commentData"
-                }
-            },
-
-            // STAGE 7: Follow Check (Kya viewer reel owner ko follow karta hai?)
-            {
-                $lookup: {
-                    from: "users",
-                    let: { ownerId: "$user" },
-                    pipeline: [
-                        { 
-                            $match: { 
-                                $expr: { $eq: ["$_id", "$$ownerId"] }, 
-                                followers: currentUserObjId 
-                            } 
-                        },
-                        { $project: { _id: 1 } }
-                    ],
-                    as: "followData"
-                }
-            },
-
-            // STAGE 8: Data Formatting (Frontend ko jaisa response chahiye waisa banao)
-            {
-                $addFields: {
-                    isFollowing: { $gt: [{ $size: "$followData" }, 0] },
-                    currentUserProfilePic: currentUserProfilePic,
-                    reelUserProfilePic: { $ifNull: ["$owner.profilePicture", ""] },
-                    seller_id: { $ifNull: ["$seller_id", "$owner.seller_id", ""] },
-                    userseller_id: { $ifNull: ["$userseller_id", "$owner.userseller_id", ""] },
-                    totalCommentsCount: { 
-                        $ifNull: [{ $arrayElemAt: ["$commentData.count", 0] }, 0] 
-                    }
-                }
-            },
-
-            // STAGE 9: Faltu kachra (Extra lookup fields) hata do taaki response size chhota rahe
-            {
-                $project: {
-                    owner: 0,
-                    commentData: 0,
-                    followData: 0
+            if (notInterestedInteractions.length > 0) {
+                const notInterestedReelIds = notInterestedInteractions.map(interaction => interaction.reel);
+                if (matchStage._id && matchStage._id.$nin) {
+                    matchStage._id.$nin.push(...notInterestedReelIds);
+                } else {
+                    matchStage._id = { $nin: notInterestedReelIds };
                 }
             }
-        ];
+        }
 
-        // Pipeline execute karo
-        const reelsWithFollow = await Reel.aggregate(reelsPipeline);
+        // 🎬 Sample random reels (Bina $lookup ke)
+        const reels = await Reel.aggregate([
+            { $match: matchStage },
+            { $sample: { size: limit } }
+        ]);
+
+        // 🔥 NAYA FIX: Mongoose Populate (Fast aur Bulletproof) 🔥
+        // Yeh sirf ek query me saare reel owners ka data le aayega bina strict format mismatch ke
+        await User.populate(reels, { 
+            path: "user", 
+            select: "profilePicture followers seller_id userseller_id" 
+        });
+
+        // 👤 Fetch current user's profile picture
+        const currentUser = await User.findById(currentUserId, "profilePicture").lean();
+        const currentUserProfilePic = currentUser?.profilePicture || "";
+        const currentUserIdStr = currentUserId.toString();
+
+        // 🔁 Map Loop
+        const reelsWithFollow = reels.map((reel) => {
+            // Populate hone ke baad `reel.user` ab ek puri object ban chuka hai
+            const owner = (reel.user && reel.user._id) ? reel.user : {};
+            
+            // Followers check karo
+            let isFollowing = false;
+            if (owner.followers && Array.isArray(owner.followers)) {
+                isFollowing = owner.followers.some(followerId => followerId.toString() === currentUserIdStr);
+            }
+
+            return {
+                ...reel, 
+                // Frontend ko ID ki aadat hai, toh object hata kar wapas string ID set kar di
+                user: owner._id ? owner._id.toString() : reel.user, 
+                isFollowing: isFollowing,
+                currentUserProfilePic,
+                reelUserProfilePic: owner.profilePicture || "", // 👈 Photo ab yahan se 100% milegi
+                seller_id: reel.seller_id || owner.seller_id || "",
+                userseller_id: reel.userseller_id || owner.userseller_id || "",
+            };
+        });
 
         res.json({ reels: reelsWithFollow, direction });
-
     } catch (e) {
         console.error("Error fetching reels:", e);
         e.statusCode = e.statusCode || 500;
-        // await logError(req, e); // Apne function ke hisaab se uncomment kar lena
         res.status(500).json({ message: "Error fetching reels" });
     }
 });
@@ -1866,7 +885,6 @@ router.get("/admin_current/:id", adminAuth, async (req, res) => {
     }
 });
 
-
 // Get other reels
 router.get("/others/:userId", async (req, res) => {
     try {
@@ -1877,13 +895,25 @@ router.get("/others/:userId", async (req, res) => {
             excludeId,
             reelType,
             currentUserId,
-            musicId
+            musicId,
+            playableOnly,
         } = req.query;
+
+        const onlyPlayable =
+            playableOnly === "1" ||
+            playableOnly === "true" ||
+            playableOnly === true;
 
         let query = {};
 
         // 🔥 BLOCKED REELS HIDE (USER SIDE)
-        query.status = { $ne: "Blocked" };
+        query.status = onlyPlayable ? "Published" : { $ne: "Blocked" };
+
+        if (onlyPlayable) {
+            query.videoUrl = { $exists: true, $nin: ["", null] };
+            // 480p goes live first; 720p is added in the background.
+            query.qualityVariants = { $in: ["480p", "720p"] };
+        }
 
         // 🎯 Decide which reels to fetch
         if (reelType === "liked") {
@@ -2024,70 +1054,75 @@ if (excludeId) {
 
 
 //delete video
-
 router.delete("/delete/:reelId/:userid", async (req, res) => {
-        try {
-            const { reelId, userid } = req.params;
+    try {
+        const { reelId, userid } = req.params;
 
-            // 1️⃣ Validate reelId
-            if (!mongoose.isValidObjectId(reelId)) {
-                return res.status(400).json({ message: "Invalid reel id" });
-            }
-
-            // 2️⃣ Find reel
-            const reel = await Reel.findById(reelId);
-            if (!reel) {
-                return res.status(404).json({ message: "Reel not found" });
-            }
-
-            // 3️⃣ OWNER CHECK (string based)
-            if (reel.userid !== userid) {
-                return res.status(403).json({
-                    message: "You are not allowed to delete this reel"
-                });
-            }
-
-            // 4️⃣ LOG (✅ ObjectId)
-            try {
-                await logUserAction({
-                    user: req.user._id,
-                    userName: req.userName,
-                    userRole: req.userRole,
-                    action: "delete_reel",
-                    targetType: "Reel",
-                    targetId: reelId,
-                    targetName: `Reel ID: ${reelId}`,
-                    device: req.headers["user-agent"],
-                    location: {
-                        ip:
-                            req.headers["x-forwarded-for"] ||
-                            req.socket.remoteAddress ||
-                            "",
-                        country: req.headers["cf-ipcountry"] || "",
-                    }
-                });
-            } catch (e) {
-                console.error("Log error:", e.message);
-            }
-
-            // 5️⃣ Delete comments
-            await Comment.deleteMany({ reel: reelId });
-
-            // 6️⃣ Delete reel
-            await reel.deleteOne();
-
-            return res.status(200).json({
-                success: true,
-                message: "Reel + comments + likes + views deleted successfully"
-            });
-
-        } catch (error) {
-            console.error("Delete reel error:", error);
-            error.statusCode = error.statusCode || 500;
-            await logError(req, error);
-            return res.status(500).json({ message: "Error deleting reel" });
+        // 1️⃣ Validate reelId
+        if (!mongoose.isValidObjectId(reelId)) {
+            return res.status(400).json({ message: "Invalid reel id" });
         }
-    });
+
+        // 2️⃣ Find reel
+        const reel = await Reel.findById(reelId);
+        if (!reel) {
+            return res.status(404).json({ message: "Reel not found" });
+        }
+
+        // 3️⃣ OWNER CHECK (✅ FIXED: Using reel.user and .toString() to match your test URL)
+        if (reel.user.toString() !== userid) {
+            return res.status(403).json({
+                message: "You are not allowed to delete this reel"
+            });
+        }
+
+        // 4️⃣ LOG (✅ ObjectId)
+        try {
+            await logUserAction({
+                user: req.user._id, // Assumes you have auth middleware setting req.user
+                userName: req.userName,
+                userRole: req.userRole,
+                action: "delete_reel",
+                targetType: "Reel",
+                targetId: reelId,
+                targetName: `Reel ID: ${reelId}`,
+                device: req.headers["user-agent"],
+                location: {
+                    ip:
+                        req.headers["x-forwarded-for"] ||
+                        req.socket.remoteAddress ||
+                        "",
+                    country: req.headers["cf-ipcountry"] || "",
+                }
+            });
+        } catch (e) {
+            console.error("Log error:", e.message);
+        }
+
+        // 5️⃣ Delete comments
+        await Comment.deleteMany({ reel: reelId });
+
+        // 6️⃣ Delete reel
+        await reel.deleteOne();
+
+        return res.status(200).json({
+            success: true,
+            message: "Reel + comments + likes + views deleted successfully"
+        });
+
+    } catch (error) {
+        console.error("Delete reel error:", error);
+        // Fallback status code if error.statusCode is undefined
+        const statusCode = error.statusCode || 500; 
+        
+        // Log error if the function exists
+        if (typeof logError === 'function') {
+            await logError(req, error);
+        }
+        
+        return res.status(statusCode).json({ message: "Error deleting reel" });
+    }
+});
 
 router.delete("/admin_delete/:reelId/:userid",adminAuth,
     checkPermission("DELETE_REEL"), async (req, res) => {
@@ -2298,7 +1333,6 @@ router.put("/like/:id", async (req, res) => {
     }
 });
 
-
 // return total likes of all users
 router.get("/totallikes",adminAuth ,  async (req, res) => {
     try {
@@ -2346,7 +1380,6 @@ router.get("/totalviews",adminAuth ,  async (req, res) => {
 });
 
 
-//  ADMIN: BLOCK / UNBLOCK REEL
 router.put("/block/:id",   async (req, res) => {
         try {
             const { id } = req.params;

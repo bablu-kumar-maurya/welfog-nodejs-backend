@@ -1,8 +1,8 @@
 import { useEffect, useState, useRef } from "react";
 import { useParams, useNavigate } from "react-router-dom";
-import axios from "axios";
+import api from "../../api/axios";
 import { MdArrowBack, MdPerson } from "react-icons/md";
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL;
+
 const LIMIT = 10;
 
 const UserFollowing = () => {
@@ -25,11 +25,8 @@ const UserFollowing = () => {
     try {
       setLoading(true);
      
-      const res = await axios.get(
-        `http://localhost:4000/api/users/admin/users/${userId}/following` , {
-        withCredentials: true
-        }
-      );
+      const res = await api.get(
+        `/api/users/admin/users/${userId}/following`);
       const list = res.data.following || [];
       setFollowing(list);
       setTotalItems(list.length);

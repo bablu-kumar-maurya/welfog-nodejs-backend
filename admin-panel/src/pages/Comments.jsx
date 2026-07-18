@@ -1,6 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import axios from 'axios';
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL;
+import api from "../api/axios";
 import {
   MdSearch,
   MdDelete,
@@ -43,18 +42,16 @@ const Comments = () => {
 
       const { search, startDate, endDate } = filters;
       
-      // ✅ FIX: localStorage se token lene ki zaroorat nahi hai
-      // ✅ FIX: withCredentials: true add kiya hai cookies ke liye
-      const res = await axios.get(`http://localhost:4000/api/comment/admin-view`, {
-        params: {
-          page,
-          limit: LIMIT,
-          search,
-          startDate,
-          endDate
-        },
-        withCredentials: true // 🛡️ Cookies automatic bhejne ke liye
-      });
+  
+   const res = await api.get("/api/comment/admin-view", {
+  params: {
+    page,
+    limit: LIMIT,
+    search,
+    startDate,
+    endDate,
+  },
+});
 
       setComments(res.data.comments || []);
       setTotalPages(res.data.totalPages || 1);
@@ -71,8 +68,7 @@ const Comments = () => {
       const userId = comment.user?._id;
       
       // ✅ FIX: headers hata kar withCredentials add kiya
-      await axios.delete(`http://localhost:4000/api/comment/admin_comment/delete/${comment._id}/${userId}`, {
-        withCredentials: true
+      await api.delete(`/api/comment/admin_comment/delete/${comment._id}/${userId}`, {
       });
 
       toast.success("Comment deleted");
@@ -97,8 +93,7 @@ const Comments = () => {
     try {
       setReelLoading(true);
       // ✅ FIX: headers hata kar withCredentials add kiya
-      const res = await axios.get(`http://localhost:4000/api/reels/admin_current/${reelId}`, {
-        withCredentials: true
+      const res = await api.get(`/api/reels/admin_current/${reelId}`, {
       });
       setSelectedReel(res.data);
       setShowReelModal(true);

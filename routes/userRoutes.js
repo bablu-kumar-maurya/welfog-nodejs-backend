@@ -591,24 +591,34 @@ router.get("/search_populer", async (req, res) => {
   }
 });
 
-//get single user
 router.get("/:id", async (req, res) => {
   try {
     const { id } = req.params;
     const viewerId = req.query.viewerId;
 
-    // 1. Fetch user
+    // 1. Fetch user (Populate waisa hi rakha hai, koi logic cut nahi kiya)
     const user = await User.findOne({
       userid: id,
       isDeleted: { $ne: true },
-    }).select("-passwordHash");
+    })
+      .populate({
+        path: "followers",
+        select: "userid username name profilePicture",
+        match: { isDeleted: { $ne: true } },
+      })
+      .populate({
+        path: "following",
+        select: "userid username name profilePicture",
+        match: { isDeleted: { $ne: true } },
+      })
+      .select("-passwordHash");
+
     if (!user) return res.status(404).json({ message: "User not found" });
 
     // 2. 🛡️ Block Check Logic (Solid Version)
     if (viewerId) {
       const viewer = await User.findById(viewerId).select("blockedUsers");
 
-      // .some() aur .toString() use karna best practice hai IDs ke liye
       const hasViewerBlockedTarget = viewer?.blockedUsers?.some(
         (bid) => bid.toString() === user._id.toString(),
       );
@@ -633,25 +643,34 @@ router.get("/:id", async (req, res) => {
       email: user.email,
       profilePicture: user.profilePicture,
       bio: user.bio,
-      isConnected: user.isConnected, // ✅ ADD
-      seller_id: user.seller_id, // ✅ ADD
-      userseller_id: user.userseller_id, // ✅ ADD
-      followers: user.followers,
-      following: user.following,
+      isConnected: user.isConnected,
+      seller_id: user.seller_id,
+      userseller_id: user.userseller_id,
+
+      // ⭐ FIX: Second API ki tarah yahan isko wapas IDs ka array bana diya 
+      // taaki tumhara UI ka "Follow/Following" button theek se kaam kare
+      followers: user.followers.map(f => f._id),
+      following: user.following.map(f => f._id),
+
+      // ⭐ NAYA: Populated data ko yahan safe rakh liya hai, in case aage avatar dikhane ho
+      followersDetails: user.followers,
+      followingDetails: user.following,
+
+      followersCount: user.followers.length,
+      followingCount: user.following.length,
+
       isSuspended: user.isSuspended,
       createdAt: user.createdAt,
       postCount,
     });
   } catch (err) {
     console.error("Error fetching user data:", err);
-    // ✅ FIX: 'error' ko 'err' kiya taaki crash na ho
     if (typeof logError === "function") {
       await logError(req, err);
     }
     res.status(500).json({ message: "Server error" });
   }
 });
-
 // get user posts with pagination
 router.get("/userpost/:id", async (req, res) => {
   try {
@@ -925,7 +944,6 @@ router.get("/userfollowing/:id", async (req, res) => {
 
     const viewerId = req.query.viewerId;
 
-    // 🔥 FIX: Fetch viewer
     let viewer = null;
     let blockedList = [];
 
@@ -933,11 +951,21 @@ router.get("/userfollowing/:id", async (req, res) => {
       viewer = await User.findById(viewerId).select("blockedUsers");
 
       if (viewer) {
-        blockedList = viewer.blockedUsers.map((id) => id.toString());
+        // ✅ 1. Users jo Viewer ne block kiye hain
+        const blockedByViewer = viewer.blockedUsers.map((id) => id.toString());
+
+        // ✅ 2. Users jinhone Viewer ko block kiya hai (Bi-directional Check)
+        const blockedViewerDocs = await User.find({
+          blockedUsers: viewer._id,
+        }).select("_id");
+        const blockedViewerIds = blockedViewerDocs.map((u) => u._id.toString());
+
+        // Merge dono lists
+        blockedList = [...blockedByViewer, ...blockedViewerIds];
       }
     }
 
-    // 🔥 FIX: Proper bi-directional block check
+    // 🔒 FULL BLOCK (Instagram style) - Agar current user aur target ke beech block hai
     const isBlocked =
       (viewer &&
         viewer.blockedUsers.some(
@@ -945,7 +973,6 @@ router.get("/userfollowing/:id", async (req, res) => {
         )) ||
       user.blockedUsers.some((id) => id.toString() === viewerId?.toString());
 
-    // 🔒 FULL BLOCK (Instagram style)
     if (isBlocked) {
       return res.json({
         ...user.toObject(),
@@ -955,39 +982,46 @@ router.get("/userfollowing/:id", async (req, res) => {
       });
     }
 
-    // ❌ Yahan se humne User.updateOne (Database update) hata diya hai!
-    // Database me deleted users ki ID safe rahegi taaki wo recover ho sakein.
-
     // 🔁 FETCH CLEAN USER WITH POPULATE + FILTERS
-    // ✅ Yahan humne 'match' condition lagayi hai taaki deleted users sirf Frontend par hide rahein
     const cleanUser = await User.findById(user._id)
       .populate({
         path: "followers",
         select: "userid username name profilePicture",
-        match: { isDeleted: { $ne: true } }, // 🔥 FILTER: Sirf active followers dikhao
+        match: { isDeleted: { $ne: true } }, 
       })
       .populate({
         path: "following",
         select: "userid username name profilePicture",
-        match: { isDeleted: { $ne: true } }, // 🔥 FILTER: Sirf active following dikhao
+        match: { isDeleted: { $ne: true } }, 
       });
 
-    // 🛡️ EXISTING FILTER (Blocked users ko hide karne ke liye)
+    // ✅ FIX: Mongoose document ko pehle Plain JS Object banao!
+    const response = cleanUser.toObject();
+
+    // ✅ FIX: Ab Plain Object par filtering apply karo
     if (blockedList.length > 0) {
-      cleanUser.followers = cleanUser.followers.filter(
+      response.followers = response.followers.filter(
         (f) => !blockedList.includes(f._id.toString()),
       );
 
-      cleanUser.following = cleanUser.following.filter(
+      response.following = response.following.filter(
         (f) => !blockedList.includes(f._id.toString()),
       );
     }
 
-    res.json(cleanUser);
+    // Update Counts
+    response.followersCount = response.followers.length;
+    response.followingCount = response.following.length;
+
+    return res.json(response);
   } catch (err) {
     console.error("Cleanup error:", err);
     err.statusCode = err.statusCode || 500;
-    await logError(req, err);
+    
+    if (typeof logError === "function") {
+        await logError(req, err);
+    }
+    
     res.status(500).json({ message: "Server error" });
   }
 });
@@ -1068,10 +1102,10 @@ router.delete("/:id", async (req, res) => {
     await user.save();
 
     await Promise.all([
-      // ✅ 1. LIKES DELETE (Turant hat jayenge)
+      // ✅ 1. LIKES DELETE
       Reel.updateMany({ likes: userId }, { $pull: { likes: userId } }),
 
-      // ✅ 2. VIEWS DELETE (Turant hat jayenge aur count -1 ho jayega)
+      // ✅ 2. VIEWS DELETE
       Reel.updateMany(
         { viewsdata: userId },
         {
@@ -1080,10 +1114,16 @@ router.delete("/:id", async (req, res) => {
         },
       ),
 
-      // ✅ 3. COMMENTS SOFT DELETE (Taaki account recover ho toh comments wapas aa jayein)
+      // ✅ 3. COMMENTS SOFT DELETE
       Comment.updateMany(
         { user: userId },
         { isDeleted: true, deletedAt: new Date() },
+      ),
+
+      // 🔥 4. NAYA FIX: REELS SOFT DELETE (Taaki API crash na ho)
+      Reel.updateMany(
+        { user: userId },
+        { isDeleted: true }
       ),
     ]);
 
@@ -1110,14 +1150,13 @@ router.delete("/:id", async (req, res) => {
 
     res.json({
       message: `Account deactivated successfully.`,
-      // ✨ NAYA MESSAGE: User ko clear batayega ki fresh account banega
       details: `Your account will be deactivated. If you log in before ${thirtyDaysLater.toDateString()}, your data will be restored. After this date, logging in will create a fresh account (your old data remains securely archived).`,
       scheduledDeletionDate: thirtyDaysLater,
     });
   } catch (err) {
     console.error("Error softly deleting user:", err);
     err.statusCode = err.statusCode || 500;
-    // await logError(req, err); // Ensure logError is defined in your file
+    // await logError(req, err);
     res.status(500).json({ message: "Server error" });
   }
 });

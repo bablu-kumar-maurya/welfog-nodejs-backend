@@ -1,11 +1,7 @@
 import { createContext, useContext, useState, useEffect, useRef } from "react";
-import axios from "axios";
+import api from "../api/axios";
 
-// ✅ Global configuration for Cookies
-axios.defaults.withCredentials = true;
-axios.defaults.headers.common["x-device-id"] = "admin-panel-web";
-const API_BASE_URL = "http://localhost:4000";
- 
+
 
 const AuthContext = createContext();
 
@@ -30,14 +26,7 @@ export const AuthProvider = ({ children }) => {
   ====================================================== */
   const verifyToken = async () => {
     try {
-   const res = await axios.get(
-  `${API_BASE_URL}/api/admin/verify`,
-  {
-    headers: {
-      "x-device-id": "admin-panel-web",
-    },
-  }
-);
+   const res = await api.get("/api/admin/verify");
 
       if (res.data.success) {
         setIsAuthenticated(true);
@@ -48,10 +37,10 @@ export const AuthProvider = ({ children }) => {
       // ✅ FIX: Agar verify fail ho (401), toh check karo ki kya refresh ho sakta hai
       if (err.response?.status === 401) {
         try {
-          const refreshRes = await axios.post(`${API_BASE_URL}/api/admin/refresh`);
+          const refreshRes = await api.post(`/api/admin/refresh`);
           if (refreshRes.data.success) {
             // Refresh success! Ab user data ke liye dobara verify call karo
-            const retryRes = await axios.get(`${API_BASE_URL}/api/admin/verify`);
+            const retryRes = await api.get(`/api/admin/verify`);
             setIsAuthenticated(true);
             setUser(retryRes.data.user);
             setUserType(retryRes.data.userType);
@@ -76,7 +65,7 @@ export const AuthProvider = ({ children }) => {
      2. AXIOS INTERCEPTOR (FOR BACKGROUND REFRESH)
   ====================================================== */
   useEffect(() => {
-    const interceptor = axios.interceptors.response.use(
+    const interceptor = api.interceptors.response.use(
       (response) => response,
       async (error) => {
         const originalRequest = error.config;
@@ -94,9 +83,9 @@ export const AuthProvider = ({ children }) => {
           isRefreshing.current = true;
 
           try {
-            await axios.post(`${API_BASE_URL}/api/admin/refresh`);
+            await api.post(`/api/admin/refresh`);
             isRefreshing.current = false;
-            return axios(originalRequest); // Retry the failed request
+            return api(originalRequest); // Retry the failed request
           } catch (err) {
             isRefreshing.current = false;
             logout(); // Full logout if refresh fails
@@ -107,7 +96,7 @@ export const AuthProvider = ({ children }) => {
       }
     );
 
-    return () => axios.interceptors.response.eject(interceptor);
+    return () => api.interceptors.response.eject(interceptor);
   }, []);
 
   /* ======================================================
@@ -116,14 +105,9 @@ export const AuthProvider = ({ children }) => {
   const login = async (credentials) => {
     try {
       setLoading(true);
-     const response = await axios.post(
-  `${API_BASE_URL}/api/admin/login`,
+     const response = await api.post(
+  `/api/admin/login`,
   credentials,
-  {
-    headers: {
-      "x-device-id": "admin-panel-web",
-    },
-  }
 );
 
       if (response.data.success) {
@@ -154,7 +138,7 @@ export const AuthProvider = ({ children }) => {
 
   const logout = async () => {
     try {
-      await axios.post(`${API_BASE_URL}/api/admin/logout`);
+      await api.post(`/api/admin/logout`);
     } catch (err) {
       console.error("Logout error", err);
     } finally {

@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
-import axios from 'axios';
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL;
+import api from "../api/axios";
+
 import {
   MdSearch,
   MdNotifications,
@@ -33,9 +33,8 @@ const Notifications = () => {
       // ✅ FIX 1: localStorage se token lene ki ab zaroorat nahi hai
       const { search, type, startDate, endDate } = filters;
        
-      // ✅ FIX 2: axios call mein 'withCredentials: true' add kiya hai
-      // Iske bina browser cookies backend ko nahi bhejega
-      const res = await axios.get(`http://localhost:4000/api/notifications/admin_notifications`, {
+   
+      const res = await api.get(`/api/notifications/admin_notifications`, {
         params: {
           page,
           limit,
@@ -44,7 +43,7 @@ const Notifications = () => {
           startDate,
           endDate
         },
-        withCredentials: true // 🛡️ Cookies automatic bhejne ke liye MUST hai
+        
       });
 
       setNotifications(res.data.notifications || []);

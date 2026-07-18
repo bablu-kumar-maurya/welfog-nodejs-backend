@@ -3,7 +3,7 @@ import { MdLogout, MdAccountCircle } from "react-icons/md";
 import toast from "react-hot-toast";
 import { useNavigate } from "react-router-dom"; 
 import { useState, useEffect } from "react";
-import axios from "axios";
+import api from "../api/axios";
 // const API_BASE_URL = import.meta.env.VITE_API_BASE_URL;
 
 const BACKEND_URL = `http://localhost:4000`;
@@ -53,10 +53,9 @@ const handleSave = async () => {
       data.append("image", formData.image);
     }
 
-    const res = await axios.put(
-      "http://localhost:4000/api/admin/update-profile",
+    const res = await api.put(
+      "/api/admin/update-profile",
       data,
-      { withCredentials: true }
     );
 
     setUser(res.data.user);
@@ -85,11 +84,8 @@ const handleSave = async () => {
   /* ================= REMOVE IMAGE ================= */
 const handleRemoveImage = async () => {
   try {
-    const res = await axios.put(
-      "http://localhost:4000/api/admin/remove-profile-image",
-      {},
-      { withCredentials: true }
-    );
+    const res = await api.put(
+      "/api/admin/remove-profile-image");
 
     console.log(res.data);
 

@@ -23,10 +23,12 @@ const reelSchema = new mongoose.Schema(
 
     status: {
       type: String,
-      enum: ["Published", "Processing", "Blocked", "Reported"],
+      enum: ["Published", "Processing", "Blocked", "Reported", "Failed"],
       default: "Processing",
       index: true,
     },
+
+    error: { type: String, default: null },
 
     blockReason: { type: String, default: null },
     blockedAt: { type: Date, default: null },

@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
-import axios from 'axios';
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL;
+import api from "../api/axios";
+
 import {
   MdSearch,
   MdDelete,
@@ -145,14 +145,14 @@ const Reels = () => {
     try {
       setLoading(true);
       const params = { page: pageNumber, limit, search, status, startDate, endDate };
-      
-      const res = await axios.get(`http://localhost:4000/api/reels/admin_reels`, { params, signal }, {
-       withCredentials: true 
-      });
+    const res = await api.get("/api/reels/admin_reels", {
+  params,
+  signal,
+});
       setReels(Array.isArray(res.data.data) ? res.data.data : []);
       setTotalReels(res.data.total || 0);
     } catch (err) {
-      if (axios.isCancel(err)) return;
+    if (err.code === "ERR_CANCELED") return;
       toast.error("permission denied");
     } finally {
       setLoading(false);
@@ -164,10 +164,10 @@ const Reels = () => {
     try {
       const action = reel.status === "Blocked" ? "unblock" : "block";
       
-      await axios.put(`http://localhost:4000/api/reels/admin_block/${reel._id}`, {
+      await api.put(`/api/reels/admin_block/${reel._id}`, {
         action
       }, {
-        withCredentials: true 
+        
       });
 
       toast.success(
@@ -236,9 +236,8 @@ const Reels = () => {
   const handleDelete = async (reel) => {
     try {
       
-      await axios.delete(
-        `http://localhost:4000/api/reels/admin_delete/${reel._id}/${reel.userid}`, {
-       withCredentials: true 
+      await api.delete(
+        `/api/reels/admin_delete/${reel._id}/${reel.userid}`, {
       }
       );
 
@@ -264,7 +263,8 @@ const Reels = () => {
         <div>
           <h1 className="text-3xl font-bold text-gray-900 mb-2">Reels</h1>
           <p className="text-gray-600">
-            Manage all video content ({totalReels})
+            {/* Manage all video content ({totalReels}) */}
+             Manage all video content 
           </p>
         </div>
       </div>

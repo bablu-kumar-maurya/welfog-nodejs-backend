@@ -1,7 +1,5 @@
-import { createContext, useContext, useState, useEffect, useRef } from "react";
+import { createContext, useContext, useState, useEffect } from "react";
 import api from "../api/axios";
-
-
 
 const AuthContext = createContext();
 
@@ -19,14 +17,12 @@ export const AuthProvider = ({ children }) => {
   const [userType, setUserType] = useState(null);
   const [loading, setLoading] = useState(true);
 
-  const isRefreshing = useRef(false);
-
   /* ======================================================
      1. VERIFY TOKEN (FIXED FOR PAGE RELOAD)
   ====================================================== */
   const verifyToken = async () => {
     try {
-   const res = await api.get("/api/admin/verify");
+      const res = await api.get("/api/admin/verify");
 
       if (res.data.success) {
         setIsAuthenticated(true);
@@ -34,7 +30,6 @@ export const AuthProvider = ({ children }) => {
         setUserType(res.data.userType);
       }
     } catch (err) {
-      // ✅ FIX: Agar verify fail ho (401), toh check karo ki kya refresh ho sakta hai
       if (err.response?.status === 401) {
         try {
           const refreshRes = await api.post(`/api/admin/refresh`);
@@ -62,9 +57,24 @@ export const AuthProvider = ({ children }) => {
   }, []);
 
   /* ======================================================
-     2. AXIOS INTERCEPTOR (FOR BACKGROUND REFRESH)
+     2. AXIOS INTERCEPTOR (FOR BACKGROUND REFRESH + QUEUE)
   ====================================================== */
   useEffect(() => {
+    // Ye local variables queue maintain karenge
+    let isRefreshing = false;
+    let failedQueue = [];
+
+    const processQueue = (error, token = null) => {
+      failedQueue.forEach(prom => {
+        if (error) {
+          prom.reject(error);
+        } else {
+          prom.resolve(token);
+        }
+      });
+      failedQueue = [];
+    };
+
     const interceptor = api.interceptors.response.use(
       (response) => response,
       async (error) => {
@@ -77,18 +87,35 @@ export const AuthProvider = ({ children }) => {
           !originalRequest.url.includes("/refresh") &&
           !originalRequest.url.includes("/login")
         ) {
-          originalRequest._retry = true;
+          
+          // Agar refresh chal raha hai, toh nai requests ko queue mein daal do
+          if (isRefreshing) {
+            return new Promise(function (resolve, reject) {
+              failedQueue.push({ resolve, reject });
+            })
+              .then(() => {
+                return api(originalRequest); // Refresh hone ke baad retry karega
+              })
+              .catch((err) => {
+                return Promise.reject(err);
+              });
+          }
 
-          if (isRefreshing.current) return Promise.reject(error);
-          isRefreshing.current = true;
+          originalRequest._retry = true;
+          isRefreshing = true;
 
           try {
             await api.post(`/api/admin/refresh`);
-            isRefreshing.current = false;
-            return api(originalRequest); // Retry the failed request
+            isRefreshing = false;
+            
+            // Queue mein ruki requests ko aage badhao
+            processQueue(null, 'success');
+            
+            return api(originalRequest); // Ye current request retry karo
           } catch (err) {
-            isRefreshing.current = false;
-            logout(); // Full logout if refresh fails
+            isRefreshing = false;
+            processQueue(err, null); // Queue fail karo
+            logoutStateOnly(); // Token sach mein expire ho chuka hai, local state clear karo
             return Promise.reject(err);
           }
         }
@@ -105,10 +132,7 @@ export const AuthProvider = ({ children }) => {
   const login = async (credentials) => {
     try {
       setLoading(true);
-     const response = await api.post(
-  `/api/admin/login`,
-  credentials,
-);
+      const response = await api.post(`/api/admin/login`, credentials);
 
       if (response.data.success) {
         const { user } = response.data;
@@ -120,7 +144,10 @@ export const AuthProvider = ({ children }) => {
       }
       return { success: false, message: response.data.message };
     } catch (error) {
-      return { success: false, message: error.response?.data?.message || "Login failed" };
+      return {
+        success: false,
+        message: error.response?.data?.message || "Login failed",
+      };
     } finally {
       setLoading(false);
     }

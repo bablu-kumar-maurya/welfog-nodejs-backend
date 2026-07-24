@@ -1,15 +1,16 @@
 const express = require("express");
 const app = express();
 require("dotenv").config();
+require("./config/firebase");
 const mongoose = require("mongoose");
 const cors = require("cors");
 const bodyParser = require("body-parser");
-const cookieParser = require("cookie-parser"); 
+const cookieParser = require("cookie-parser");
 const authenticateToken = require("./middleware/auth");
 const checkMaintenance = require("./middleware/checkMaintenance");
 const path = require("path");
 
-const rateLimit = require("express-rate-limit"); 
+const rateLimit = require("express-rate-limit");
 
 // 🔥 FFMPEG WASM KE LIYE COOP AUR COEP HEADERS (Top par)
 app.use((req, res, next) => {
@@ -23,15 +24,15 @@ app.use((req, res, next) => {
 
 app.use(express.static(path.join(__dirname, "public")));
 app.use(checkMaintenance);
-app.use(cookieParser()); 
+app.use(cookieParser());
 
 const allowedOrigins = [
-  "http://localhost:5173", 
+  "http://localhost:5173",
   "http://localhost:3000",
-  "http://127.0.0.1:5500", 
-  "http://localhost:5500", 
-  "null",       
-  "http://localhost:4000",           
+  "http://127.0.0.1:5500",
+  "http://localhost:5500",
+  "null",
+  "http://localhost:4000",
   "https://supplier.welfog.com",
   "https://welfog-backend.vercel.app",
   "https://play.welfog.com",
@@ -48,14 +49,14 @@ app.use(cors({
   },
   credentials: true,
   allowedHeaders: [
-    "Content-Type", 
-    "Authorization", 
-    "x-device-id",       
-    "x-android-id",      
-    "x-ios-idfv",        
-    "x-machine-id",      
+    "Content-Type",
+    "Authorization",
+    "x-device-id",
+    "x-android-id",
+    "x-ios-idfv",
+    "x-machine-id",
     "Accept"
-  ] 
+  ]
 }));
 
 app.use(bodyParser.json());
@@ -67,13 +68,13 @@ const bannedClients = new Map();
 app.set("trust proxy", true);
 
 const getClientInfo = (req) => {
-  const deviceId = 
-    req.headers["x-android-id"] ||    
-    req.headers["x-ios-idfv"] ||      
-    req.headers["x-machine-id"] ||    
-    req.headers["x-device-id"] ||     
-    req.cookies["x-device-id"];       
-    
+  const deviceId =
+    req.headers["x-android-id"] ||
+    req.headers["x-ios-idfv"] ||
+    req.headers["x-machine-id"] ||
+    req.headers["x-device-id"] ||
+    req.cookies["x-device-id"];
+
   let ip = req.ip || req.connection.remoteAddress || "unknown_ip";
   if (req.headers["x-forwarded-for"]) {
     ip = req.headers["x-forwarded-for"].split(",")[0].trim();
@@ -88,7 +89,7 @@ const getClientInfo = (req) => {
 const PUBLIC_SHARE_ROUTES = [
   "/api/plays/r/",
   "/api/plays/dl/reel/",
-  "/api/plays/p/",          
+  "/api/plays/p/",
   "/api/plays/dl/profile/",
   "/deeplink-test.html"
 ];
@@ -106,9 +107,9 @@ const requireDeviceId = (req, res, next) => {
   }
 
   if (req.path === "/") return next();
-  
+
   if (isPublicShareRoute(req)) {
-      return next(); 
+    return next();
   }
 
   const { deviceId } = getClientInfo(req);
@@ -124,8 +125,8 @@ const requireDeviceId = (req, res, next) => {
 app.use(requireDeviceId);
 
 const apiScriptLimiter = rateLimit({
-  windowMs: 10 * 60 * 1000, 
-  max: 1000, 
+  windowMs: 10 * 60 * 1000,
+  max: 1000,
   standardHeaders: true,
   legacyHeaders: false,
   keyGenerator: (req) => {
@@ -142,7 +143,7 @@ const apiScriptLimiter = rateLimit({
   },
 });
 
-app.use(apiScriptLimiter); 
+app.use(apiScriptLimiter);
 
 const checkIPBan = (req, res, next) => {
   const { deviceId, ip } = getClientInfo(req);
@@ -171,7 +172,7 @@ const checkIPBan = (req, res, next) => {
 };
 
 const globalLimiter = rateLimit({
-  windowMs: 10 * 60 * 1000, 
+  windowMs: 10 * 60 * 1000,
   max: 1000,
   standardHeaders: true,
   legacyHeaders: false,
@@ -221,14 +222,14 @@ app.use("/api/comment", commentRoute);
 app.use("/api/notifications", notificationRoute);
 app.use("/api/admin", adminRoute);
 app.use("/api/roles", roleRoutes);
-app.use("/api/plays", shareRoutes); 
+app.use("/api/plays", shareRoutes);
 app.use("/api/suspend", suspendRoutes);
 app.use("/api/uploads", uploadRoute);
 app.use("/api/userblocks", userblockRoute);
 
 app.get("/", (req, res) => {
   res.json({
-     "version": "1.0.19",
+    "version": "1.0.20",
     status: "Server is running successfully! "
   });
 });

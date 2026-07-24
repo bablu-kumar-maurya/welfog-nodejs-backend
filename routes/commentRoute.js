@@ -114,7 +114,7 @@ router.post("/new", async (req, res) => {
             senderObjectId: user._id,
             recipientUserId: targetComment.user.userid,
             senderUserId: user.userid,
-            type: "comment",
+            type: "comment_reply",
             reel: reelId,
             comment: savedComment._id,
             message: `replied to your comment: "${savedComment.text}"`,
@@ -140,7 +140,7 @@ router.post("/new", async (req, res) => {
 });
 
 
-router.get("/",  async (req, res) => {
+router.get("/", async (req, res) => {
   try {
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 15;
@@ -158,7 +158,7 @@ router.get("/",  async (req, res) => {
       // ✨ NAYI LINE: Search mein deleted user include na ho
       const users = await User.find({
         username: { $regex: search, $options: "i" },
-        isDeleted: { $ne: true } 
+        isDeleted: { $ne: true }
       }).select("_id");
 
       const userIds = users.map(u => u._id);
@@ -192,7 +192,7 @@ router.get("/",  async (req, res) => {
       .populate({
         path: "user",
         select: "userid username name profilePicture",
-        match: { isDeleted: { $ne: true } } 
+        match: { isDeleted: { $ne: true } }
       })
       .populate("reel", "caption")
       .sort({ createdAt: -1 })
@@ -229,7 +229,7 @@ router.get("/admin-view", adminAuth, checkPermission("VIEW_COMMENTS"), async (re
     const status = req.query.status || "all"; // Naya status parameter add kiya
     const startDate = req.query.startDate || "";
     const endDate = req.query.endDate || "";
-    
+
     const skip = (page - 1) * limit;
 
     // 🔍 Build Query Object
@@ -305,7 +305,7 @@ router.get("/admin-view", adminAuth, checkPermission("VIEW_COMMENTS"), async (re
 });
 
 
-router.get("/user/:userid", adminAuth ,  async (req, res) => {
+router.get("/user/:userid", adminAuth, async (req, res) => {
   try {
     const { userid } = req.params;
 
@@ -313,14 +313,14 @@ router.get("/user/:userid", adminAuth ,  async (req, res) => {
     const page = parseInt(req.query.page) || 1;
     const limit = 10;
     const skip = (page - 1) * limit;
-const startDate = req.query.startDate;
+    const startDate = req.query.startDate;
     const endDate = req.query.endDate;
     // find user by custom userid
     const user = await User.findOne({ userid });
     if (!user) {
       return res.status(404).json({ message: "User not found" });
     }
-     const commentQuery = { user: user._id };
+    const commentQuery = { user: user._id };
 
     if (startDate || endDate) {
       commentQuery.createdAt = {};
@@ -435,7 +435,7 @@ router.delete(
           action: "delete_comment",
           targetType: "Comment",
           targetId: deleted._id,
-          
+
           // ✅ YAHAN ADD KIYA: ID aur Actual Comment Text
           targetName: `ID: ${deleted._id} (${deletedCommentText})`,
 
@@ -509,7 +509,7 @@ router.delete(
           action: "delete_comment",
           targetType: "Comment",
           targetId: deleted._id,
-          
+
           // ✅ YAHAN ADD KIYA: ID aur Actual Comment Text
           targetName: `ID: ${deleted._id} (${deletedCommentText})`,
 
@@ -533,7 +533,7 @@ router.delete(
     } catch (error) {
       console.error("Error in Delete Comment", error);
       error.statusCode = error.statusCode || 500;
-        await logError(req, error);
+      await logError(req, error);
       res.status(500).json({ message: "Error in Comment delete" });
     }
   }
@@ -599,7 +599,7 @@ router.put("/update/:id", async (req, res) => {
   } catch (error) {
     console.log("Error in Update Comment", error);
     error.statusCode = error.statusCode || 500;
-      await logError(req, error);
+    await logError(req, error);
     res.status(500).json({ message: "Error in Comment" });
   }
 });
@@ -613,18 +613,18 @@ router.get('/reel/:reelId', async (req, res) => {
     // 🛡️ BLOCK FILTER LOGIC START
     let blockedList = [];
     if (viewerId) {
-        const viewer = await User.findById(viewerId).select("blockedUsers");
-        if (viewer && viewer.blockedUsers) {
-            blockedList = viewer.blockedUsers;
-        }
+      const viewer = await User.findById(viewerId).select("blockedUsers");
+      if (viewer && viewer.blockedUsers) {
+        blockedList = viewer.blockedUsers;
+      }
     }
     // 🛡️ BLOCK FILTER LOGIC END
 
     // ✅ Step 1: Fetch Main Comments (Filtered by blocked users)
-    const comments = await Comment.find({ 
-        reel: reelId, 
-        parentComment: null,
-        user: { $nin: blockedList } // 🔥 ADDED: Blocked logo ke main comments hide karo
+    const comments = await Comment.find({
+      reel: reelId,
+      parentComment: null,
+      user: { $nin: blockedList } // 🔥 ADDED: Blocked logo ke main comments hide karo
     })
       .populate('user', 'username profilePicture')
       .sort({ createdAt: -1 });
@@ -632,9 +632,9 @@ router.get('/reel/:reelId', async (req, res) => {
     const commentsWithReplies = await Promise.all(
       comments.map(async (comment) => {
         // ✅ Step 2: Fetch Replies (Filtered by blocked users)
-        const replies = await Comment.find({ 
-            parentComment: comment._id,
-            user: { $nin: blockedList } // 🔥 ADDED: Blocked logo ke replies bhi hide karo
+        const replies = await Comment.find({
+          parentComment: comment._id,
+          user: { $nin: blockedList } // 🔥 ADDED: Blocked logo ke replies bhi hide karo
         })
           .populate('user', 'username profilePicture')
           .sort({ createdAt: 1 });
@@ -647,7 +647,7 @@ router.get('/reel/:reelId', async (req, res) => {
   } catch (error) {
     console.error("Error fetching comments:", error);
     if (typeof logError === 'function') {
-        await logError(req, error);
+      await logError(req, error);
     }
     if (!res.headersSent) {
       return res.status(500).json({ message: "Internal Server Error" });
@@ -677,6 +677,16 @@ router.put("/like/:id", async (req, res) => {
 
     // 🔹 Fetch comment with user populated
     const comment = await Comment.findById(commentId).populate("user");
+
+    console.log("========== COMMENT DEBUG ==========");
+    console.log("Comment User:", comment.user);
+    console.log("Comment User ID:", comment.user?._id?.toString());
+    console.log("Comment User userid:", comment.user?.userid);
+    console.log("Liker User ID:", userId.toString());
+    console.log(
+      "Is Self Like:",
+      comment.user?._id?.toString() === userId.toString()
+    );
     if (!comment) {
       return res.status(404).json({ message: "Comment not found" });
     }
@@ -726,7 +736,7 @@ router.put("/like/:id", async (req, res) => {
           senderObjectId: userId,
           recipientUserId: comment.user.userid,
           senderUserId: user.userid,
-          type: "comment",
+          type: "comment_like",
           reel: comment.reel,
           comment: comment._id,
           message: comment.parentComment
@@ -755,7 +765,7 @@ router.put("/like/:id", async (req, res) => {
 
 
 // GET all comments liked by a user (ADMIN VIEW)
-router.get("/admin/users/:userid/liked-comments", adminAuth , async (req, res) => {
+router.get("/admin/users/:userid/liked-comments", adminAuth, async (req, res) => {
   try {
     const { userid } = req.params;
 
@@ -804,7 +814,7 @@ router.get("/admin/users/:userid/liked-comments", adminAuth , async (req, res) =
   } catch (error) {
     console.error("Error fetching liked comments:", error);
     error.statusCode = error.statusCode || 500;
-      await logError(req, error);
+    await logError(req, error);
     return res.status(500).json({ message: "Server error" });
   }
 });
@@ -841,8 +851,8 @@ router.post("/check-seller-connection", async (req, res) => {
 
     if (!seller) {
       return res.status(404).json({
-        message: "Seller not found" ,
-         isConnected: false
+        message: "Seller not found",
+        isConnected: false
       });
     }
 

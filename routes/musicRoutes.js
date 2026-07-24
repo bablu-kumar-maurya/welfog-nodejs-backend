@@ -157,124 +157,124 @@ router.post("/new", async (req, res) => {
 });
 
 
- 
-router.get("/",async (req, res) => {
-    try {
-      const page = parseInt(req.query.page) || 1;
-      const limit = parseInt(req.query.limit) || 12;
-      const search = req.query.search || "";
-      const startDate = req.query.startDate || "";
-      const endDate = req.query.endDate || "";
 
-      let filter = {};
+router.get("/", async (req, res) => {
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 12;
+    const search = req.query.search || "";
+    const startDate = req.query.startDate || "";
+    const endDate = req.query.endDate || "";
 
-      // 🔍 Search Filter
-      if (search) {
-        filter.$or = [
-          { title: { $regex: search, $options: "i" } },
-          { artist: { $regex: search, $options: "i" } }
-        ];
-      }
+    let filter = {};
 
-      // 📅 Date Range Filter
-      if (startDate || endDate) {
-        filter.createdAt = {};
-
-        if (startDate) {
-          filter.createdAt.$gte = new Date(startDate);
-        }
-
-        if (endDate) {
-          const end = new Date(endDate);
-          end.setHours(23, 59, 59, 999); // include full end day
-          filter.createdAt.$lte = end;
-        }
-      }
-
-      const totalItems = await Music.countDocuments(filter);
-      const totalPages = Math.ceil(totalItems / limit);
-
-      const data = await Music.find(filter)
-        .skip((page - 1) * limit)
-        .limit(limit)
-        .sort({ createdAt: -1 });
-
-      res.json({
-        success: true,
-        page,
-        limit,
-        totalItems,
-        totalPages,
-        data
-      });
-
-    } catch (error) {
-      console.error("Error fetching music:", error);
-      error.statusCode = error.statusCode || 500;
-      await logError(req, error);
-      res.status(500).json({ success: false, message: "Server error" });
+    // 🔍 Search Filter
+    if (search) {
+      filter.$or = [
+        { title: { $regex: search, $options: "i" } },
+        { artist: { $regex: search, $options: "i" } }
+      ];
     }
+
+    // 📅 Date Range Filter
+    if (startDate || endDate) {
+      filter.createdAt = {};
+
+      if (startDate) {
+        filter.createdAt.$gte = new Date(startDate);
+      }
+
+      if (endDate) {
+        const end = new Date(endDate);
+        end.setHours(23, 59, 59, 999); // include full end day
+        filter.createdAt.$lte = end;
+      }
+    }
+
+    const totalItems = await Music.countDocuments(filter);
+    const totalPages = Math.ceil(totalItems / limit);
+
+    const data = await Music.find(filter)
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .sort({ createdAt: -1 });
+
+    res.json({
+      success: true,
+      page,
+      limit,
+      totalItems,
+      totalPages,
+      data
+    });
+
+  } catch (error) {
+    console.error("Error fetching music:", error);
+    error.statusCode = error.statusCode || 500;
+    await logError(req, error);
+    res.status(500).json({ success: false, message: "Server error" });
   }
+}
 );
 
 
 router.get("/admin-view", adminAuth, checkPermission("VIEW_MUSIC"), async (req, res) => {
-    try {
-      const page = parseInt(req.query.page) || 1;
-      const limit = parseInt(req.query.limit) || 12;
-      const search = req.query.search || "";
-      const startDate = req.query.startDate || "";
-      const endDate = req.query.endDate || "";
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 12;
+    const search = req.query.search || "";
+    const startDate = req.query.startDate || "";
+    const endDate = req.query.endDate || "";
 
-      let filter = {};
+    let filter = {};
 
-      // 🔍 Search Filter
-      if (search) {
-        filter.$or = [
-          { title: { $regex: search, $options: "i" } },
-          { artist: { $regex: search, $options: "i" } }
-        ];
-      }
-
-      // 📅 Date Range Filter
-      if (startDate || endDate) {
-        filter.createdAt = {};
-
-        if (startDate) {
-          filter.createdAt.$gte = new Date(startDate);
-        }
-
-        if (endDate) {
-          const end = new Date(endDate);
-          end.setHours(23, 59, 59, 999); // include full end day
-          filter.createdAt.$lte = end;
-        }
-      }
-
-      const totalItems = await Music.countDocuments(filter);
-      const totalPages = Math.ceil(totalItems / limit);
-
-      const data = await Music.find(filter)
-        .skip((page - 1) * limit)
-        .limit(limit)
-        .sort({ createdAt: -1 });
-
-      res.json({
-        success: true,
-        page,
-        limit,
-        totalItems,
-        totalPages,
-        data
-      });
-
-    } catch (error) {
-      console.error("Error fetching music:", error);
-      error.statusCode = error.statusCode || 500;
-      await logError(req, error);
-      res.status(500).json({ success: false, message: "Server error" });
+    // 🔍 Search Filter
+    if (search) {
+      filter.$or = [
+        { title: { $regex: search, $options: "i" } },
+        { artist: { $regex: search, $options: "i" } }
+      ];
     }
+
+    // 📅 Date Range Filter
+    if (startDate || endDate) {
+      filter.createdAt = {};
+
+      if (startDate) {
+        filter.createdAt.$gte = new Date(startDate);
+      }
+
+      if (endDate) {
+        const end = new Date(endDate);
+        end.setHours(23, 59, 59, 999); // include full end day
+        filter.createdAt.$lte = end;
+      }
+    }
+
+    const totalItems = await Music.countDocuments(filter);
+    const totalPages = Math.ceil(totalItems / limit);
+
+    const data = await Music.find(filter)
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .sort({ createdAt: -1 });
+
+    res.json({
+      success: true,
+      page,
+      limit,
+      totalItems,
+      totalPages,
+      data
+    });
+
+  } catch (error) {
+    console.error("Error fetching music:", error);
+    error.statusCode = error.statusCode || 500;
+    await logError(req, error);
+    res.status(500).json({ success: false, message: "Server error" });
   }
+}
 );
 
 //find single music 
@@ -343,7 +343,7 @@ router.get("/users/:userId/music", async (req, res) => {
 
 
 // Delete music
-router.delete("/delete/:id", adminAuth, checkPermission("DELETE_MUSIC") , async (req, res) => {
+router.delete("/delete/:id", adminAuth, checkPermission("DELETE_MUSIC"), async (req, res) => {
   try {
     const musicId = req.params.id;
 
@@ -378,7 +378,62 @@ router.delete("/delete/:id", adminAuth, checkPermission("DELETE_MUSIC") , async 
   }
 });
 
+// Update userid after first login
+router.put("/update-userid", async (req, res) => {
+  try {
+    const { mobile, userid } = req.body;
 
+    if (!mobile || !userid) {
+      return res.status(400).json({
+        success: false,
+        message: "mobile and userid are required"
+      });
+    }
+
+    const user = await User.findOne({ mobile });
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found"
+      });
+    }
+
+    // Same hai to update ki zarurat nahi
+    if (user.userid === userid) {
+      return res.status(200).json({
+        success: true,
+        message: "Userid already updated",
+        user
+      });
+    }
+
+    const oldUserId = user.userid;
+
+    user.userid = userid;
+    await user.save();
+
+    return res.status(200).json({
+      success: true,
+      message: "Userid updated successfully",
+      oldUserId,
+      newUserId: userid
+    });
+
+  } catch (error) {
+    console.error("Update userid error:", error);
+
+    if (typeof logError === "function") {
+      error.statusCode = error.statusCode || 500;
+      await logError(req, error);
+    }
+
+    return res.status(500).json({
+      success: false,
+      message: "Internal server error"
+    });
+  }
+});
 
 
 module.exports = router;

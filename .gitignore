@@ -38,3 +38,6 @@ Thumbs.db
 .cache/
 npm-cache/
 yarn-cache/
+
+
+config/firebase-service-account.json

@@ -1,6 +1,6 @@
 const mongoose = require("mongoose");
 const bcrypt = require("bcryptjs");
-const { v4: uuidv4 } = require("uuid");
+// 🔥 uuidv4 ka import yahan se hata diya hai
 
 // ================= USER SCHEMA =================
 
@@ -8,20 +8,20 @@ const userSchema = new mongoose.Schema({
   userid: {
     type: String,
     required: true,
-    unique: true,
-    default: uuidv4,
+    unique: true, // ✅ UserID hamesha unique rahegi
+    // 🔥 default: uuidv4 yahan se hata diya hai
   },
 
   // 🔥 SELLER FIELDS FIXED (Removed default: "")
   seller_id: {
     type: String,
-    unique: true, 
-    sparse: true, 
+    unique: true,
+    sparse: true,
   },
   userseller_id: {
     type: String,
-    unique: true, 
-    sparse: true, 
+    unique: true,
+    sparse: true,
   },
 
   // ✅ SOFT DELETE FIELDS ADDED
@@ -32,14 +32,14 @@ const userSchema = new mongoose.Schema({
   username: { type: String, unique: true, required: true },
   mobile: { type: String, required: true, unique: true },
   email: { type: String, default: "" },
-  
+
   blockedUsers: [{ type: mongoose.Schema.Types.ObjectId, ref: "User4" }],
 
   profilePicture: { type: String, default: "" },
 
   followers: [{ type: mongoose.Schema.Types.ObjectId, ref: "User4" }],
   following: [{ type: mongoose.Schema.Types.ObjectId, ref: "User4" }],
-  
+
   isConnected: {
     type: Boolean,
     default: false,
@@ -57,6 +57,10 @@ const userSchema = new mongoose.Schema({
   },
   suspendedAt: {
     type: Date,
+  },
+  fcmToken: {
+    type: String,
+    default: "",
   },
   bio: { type: String, default: "" },
   isSuspended: { type: Boolean, required: true, default: false },
@@ -113,7 +117,9 @@ userSchema.statics.generateUniqueUsername = async function () {
 userSchema.pre("save", async function (next) {
   try {
     if (!this.isNew) return next();
-    if (!this.userid) this.userid = uuidv4();
+
+    // 🔥 YAHAN SE BHI uuidv4() GENERATE KARNE WALI LINE HATA DI HAI
+    // Ab user.userid wahi rahegi jo tumne API (frontend) se bheji thi
 
     const Reel = mongoose.model("Reel4test");
     const Music = mongoose.model("Music");

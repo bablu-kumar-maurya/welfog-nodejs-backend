@@ -39,6 +39,12 @@ router.post("/", async (req, res) => {
     }
     mobile = mobile.replace(/\D/g, "");
 
+    // Normalize shop user id from frontend (e.g. "1773")
+    const incomingUserId =
+      userid !== undefined && userid !== null && String(userid).trim() !== ""
+        ? String(userid).trim()
+        : null;
+
     // ✨ SABSE PEHLE USER FIND KARO (Username check karne se bhi pehle)
     let existingUser = await User.findOne({ mobile });
 
@@ -51,14 +57,12 @@ router.post("/", async (req, res) => {
         Date.now() - new Date(existingUser.deletedAt).getTime();
 
       if (timePassed <= thirtyDays) {
-        // Yahan Frontend ko pata chal jayega ki account recover karna hai
         return res.status(403).json({
           message: "Your account is deactivated. Do you want to reactivate it?",
           needsReactivation: true,
           mobile: existingUser.mobile,
         });
       } else {
-        // 30 Din ke baad aaya hai - Archive kar do taaki naya ban sake
         const timestamp = Date.now();
         existingUser.mobile = `${existingUser.mobile}_hidden_${timestamp}`;
         existingUser.username = `${existingUser.username}_hidden_${timestamp}`;
@@ -75,28 +79,25 @@ router.post("/", async (req, res) => {
     // 2. EXISTING ACTIVE USER LOGIN
     // ==========================================
     if (existingUser) {
-      // Agar user login ke time koi naya profile update bhej raha hai
       if (username && existingUser.username !== username.toLowerCase().trim()) {
         const formattedUsername = username.toLowerCase().trim();
 
-        // ✨ UPDATED: Regex check to block symbols & spaces but ALLOW underscores
         const usernameRegex = /^[a-z0-9_]+$/;
         if (!usernameRegex.test(formattedUsername)) {
-          return res
-            .status(400)
-            .json({
-              message:
-                "Username can only contain letters, numbers, and underscores. Spaces or other symbols are not allowed.",
-            });
+          return res.status(400).json({
+            message:
+              "Username can only contain letters, numbers, and underscores. Spaces or other symbols are not allowed.",
+          });
         }
 
         const usernameTaken = await User.findOne({
           username: formattedUsername,
         });
-        if (usernameTaken)
+        if (usernameTaken) {
           return res
             .status(400)
             .json({ message: "This username is already taken" });
+        }
         existingUser.username = formattedUsername;
       }
 
@@ -105,13 +106,17 @@ router.post("/", async (req, res) => {
       if (profilePicture) existingUser.profilePicture = profilePicture;
       if (bio) existingUser.bio = bio;
 
-      // 🔥 FIX: Yahan seller_id aur userseller_id update karna zaroori hai! 🔥
       if (seller_id) existingUser.seller_id = seller_id;
       if (userseller_id) existingUser.userseller_id = userseller_id;
 
       if (typeof isConnected !== "undefined") {
         existingUser.isConnected = isConnected;
         existingUser.lastConnectedAt = new Date();
+      }
+
+      // 🔥 FIX: login / bootstrap pe frontend wali shop userid save karo
+      if (incomingUserId) {
+        existingUser.userid = incomingUserId;
       }
 
       await existingUser.save();
@@ -128,19 +133,24 @@ router.post("/", async (req, res) => {
         bio: existingUser.bio,
         followers: existingUser.followers,
         following: existingUser.following,
-        seller_id: existingUser.seller_id, // Response me wapas bhej do
-        userseller_id: existingUser.userseller_id, // Response me wapas bhej do
+        seller_id: existingUser.seller_id,
+        userseller_id: existingUser.userseller_id,
       });
     }
 
     // ==========================================
     // 3. FRESH NAYA ACCOUNT (New Registration)
     // ==========================================
-    // Agar existingUser nahi hai, TABHI hum username demand karenge!
     if (!username) {
       return res
         .status(400)
         .json({ message: "Username is required to create a new account" });
+    }
+
+    if (!incomingUserId) {
+      return res
+        .status(400)
+        .json({ message: "User ID is required to create a new account" });
     }
 
     username = username.toLowerCase().trim();
@@ -150,15 +160,12 @@ router.post("/", async (req, res) => {
         .json({ message: "Username must be 3-20 characters" });
     }
 
-    // ✨ UPDATED: Regex check to block symbols & spaces but ALLOW underscores for new accounts
     const usernameRegex = /^[a-z0-9_]+$/;
     if (!usernameRegex.test(username)) {
-      return res
-        .status(400)
-        .json({
-          message:
-            "Username can only contain letters, numbers, and underscores. Spaces or other symbols are not allowed.",
-        });
+      return res.status(400).json({
+        message:
+          "Username can only contain letters, numbers, and underscores. Spaces or other symbols are not allowed.",
+      });
     }
 
     const existingUsername = await User.findOne({ username });
@@ -166,8 +173,12 @@ router.post("/", async (req, res) => {
       return res.status(400).json({ message: "Username already taken" });
     }
 
+    console.log("==== DEBUGGING START ====");
+    console.log("Frontend se aayi ID:", incomingUserId);
+    console.log("=========================");
+
     const newUser = new User({
-      userid: uuidv4(),
+      userid: incomingUserId, // shop login user_id (e.g. "1773")
       mobile,
       username,
       name: name || "",
@@ -181,6 +192,8 @@ router.post("/", async (req, res) => {
     if (userseller_id) newUser.userseller_id = userseller_id;
 
     const savedUser = await newUser.save();
+
+    console.log("Database me save hone ke baad ID:", savedUser.userid);
 
     return res.status(201).json({
       message: "User registered successfully",
@@ -987,12 +1000,12 @@ router.get("/userfollowing/:id", async (req, res) => {
       .populate({
         path: "followers",
         select: "userid username name profilePicture",
-        match: { isDeleted: { $ne: true } }, 
+        match: { isDeleted: { $ne: true } },
       })
       .populate({
         path: "following",
         select: "userid username name profilePicture",
-        match: { isDeleted: { $ne: true } }, 
+        match: { isDeleted: { $ne: true } },
       });
 
     // ✅ FIX: Mongoose document ko pehle Plain JS Object banao!
@@ -1017,11 +1030,11 @@ router.get("/userfollowing/:id", async (req, res) => {
   } catch (err) {
     console.error("Cleanup error:", err);
     err.statusCode = err.statusCode || 500;
-    
+
     if (typeof logError === "function") {
-        await logError(req, err);
+      await logError(req, err);
     }
-    
+
     res.status(500).json({ message: "Server error" });
   }
 });

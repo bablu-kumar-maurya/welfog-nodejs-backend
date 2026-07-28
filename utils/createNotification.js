@@ -18,7 +18,7 @@ const createNotification = async ({
 }) => {
   console.log("\n========== createNotification Called ==========");
   console.log({
-    recipientUserId,
+    recipientUserId,                                             
     senderUserId,
     recipientObjectId,
     senderObjectId,
@@ -65,26 +65,29 @@ const createNotification = async ({
 
     console.log("✅ Notification saved in MongoDB");
 
+    const targetUserId = isNaN(Number(recipientUserId)) ? recipientUserId : Number(recipientUserId);
+    const notificationId = reel || comment || `${type}_${Date.now()}`;
+
     const payload = {
-      id: `${type}_${reel || comment || Date.now()}_${Date.now()}`,
-      user_id: Number(recipientUserId),
+      id: notificationId,
+      user_id: targetUserId,
       data: {
         Type: "play",
-        id: reel || comment || null,
-        message: message,
+        id: notificationId,
+        message,
         recipient: recipientObjectId,
         sender: senderObjectId,
-        recipientUserId: recipientUserId,
-        senderUserId: senderUserId,
+        recipientUserId,
+        senderUserId,
         play_type: type,
-        reel: reel,
-        comment: comment,
+        reel,
+        comment,
       },
     };
 
     console.log("\n========== API Payload ==========");
     console.log("recipientUserId :", recipientUserId);
-    console.log("Converted user_id :", Number(recipientUserId));
+    console.log("Converted user_id :", targetUserId);
     console.log(JSON.stringify(payload, null, 2));
 
     try {

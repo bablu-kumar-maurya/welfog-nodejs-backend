@@ -8,7 +8,7 @@ const adminAuth = require("../middleware/adminAuth");
 const checkPermission = require("../middleware/checkPermission");
 const logUserAction = require("../utils/logUserAction");
 const logError = require("../utils/logError");
-
+const Reel = require("../models/Reel");
 
 router.get("/search", async (req, res) => {
   const { q } = req.query;
@@ -386,40 +386,57 @@ router.put("/update-userid", async (req, res) => {
     if (!mobile || !userid) {
       return res.status(400).json({
         success: false,
-        message: "mobile and userid are required"
+        message: "mobile and userid are required",
       });
     }
 
+    // Find user
     const user = await User.findOne({ mobile });
 
     if (!user) {
       return res.status(404).json({
         success: false,
-        message: "User not found"
+        message: "User not found",
       });
     }
 
-    // Same hai to update ki zarurat nahi
-    if (user.userid === userid) {
-      return res.status(200).json({
-        success: true,
-        message: "Userid already updated",
-        user
-      });
-    }
-
+    // Save old userid
     const oldUserId = user.userid;
 
-    user.userid = userid;
-    await user.save();
+    // Update userid only if different
+    if (user.userid !== userid) {
+      user.userid = userid;
+      await user.save();
+    }
+
+    // Sync all reels of this user
+    const reelResult = await Reel.updateMany(
+      { user: user._id },
+      {
+        $set: {
+          userid: userid,
+        },
+      }
+    );
+
+    console.log("======================================");
+    console.log("User ObjectId :", user._id.toString());
+    console.log("Old UserId    :", oldUserId);
+    console.log("New UserId    :", userid);
+    console.log("Reels Updated :", reelResult.modifiedCount);
+    console.log("======================================");
 
     return res.status(200).json({
       success: true,
-      message: "Userid updated successfully",
+      message:
+        oldUserId === userid
+          ? "Userid already updated, reels synced successfully"
+          : "Userid updated successfully",
       oldUserId,
-      newUserId: userid
+      newUserId: userid,
+      reelsMatched: reelResult.matchedCount,
+      reelsUpdated: reelResult.modifiedCount,
     });
-
   } catch (error) {
     console.error("Update userid error:", error);
 
@@ -430,10 +447,9 @@ router.put("/update-userid", async (req, res) => {
 
     return res.status(500).json({
       success: false,
-      message: "Internal server error"
+      message: "Internal server error",
     });
   }
 });
-
 
 module.exports = router;

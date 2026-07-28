@@ -4,7 +4,7 @@ const router = express.Router();
 const Comment = require("../models/Comment");
 const Reel = require("../models/Reel");
 const User = require("../models/Users");
-const Music = require("../models/Music"); 
+const Music = require("../models/Music");
 const multer = require("multer");
 const logUserAction = require("../utils/logUserAction");
 const fs = require("fs");
@@ -19,11 +19,13 @@ const { generateShortLink } = require("../utils/shortLink");
 const ReelInteraction = require('../models/ReelInteraction');
 
 // ===== NEW: REDIS & QUEUE SETUP =====
+console.log("🔄 [ROUTER] Setting up Redis Queue connection...");
 const { Queue } = require('bullmq');
 const IORedis = require('ioredis');
 // Default Redis connection (Localhost). Agar production par ho toh actual Redis URL dalna.
-const redisConnection = new IORedis({ maxRetriesPerRequest: null }); 
+const redisConnection = new IORedis({ maxRetriesPerRequest: null });
 const reelQueue = new Queue('reel-processing', { connection: redisConnection });
+console.log("✅ [ROUTER] Redis Queue (reel-processing) initialized.");
 // =====================================
 
 // S3 Presigned URL Generator ke liye AWS SDK zaroori hai
@@ -41,17 +43,21 @@ const s3Client = new S3Client({
 
 const upload = multer({
     storage: multer.memoryStorage(),
-    limits: { fileSize: 200 * 1024 * 1024 } 
+    limits: { fileSize: 200 * 1024 * 1024 }
 });
 
 // =================================================================
 // === NEW ROUTE: GENERATE PRESIGNED URL FOR DIRECT S3 UPLOAD ===
 // =================================================================
 router.post("/generate-upload-url", async (req, res) => {
-    console.log("✅ YAY! Route hit ho gaya!");
+    console.log("\n=======================================================");
+    console.log("📡 [POST /generate-upload-url] API Hit!");
+    console.log("📦 Request Body:", req.body);
+    
     try {
         const { filename, fileType, isThumbnail } = req.body;
         if (!filename || !fileType) {
+            console.warn("⚠️ [generate-upload-url] Missing filename or fileType in request.");
             return res.status(400).json({ success: false, message: "filename and fileType are required" });
         }
 
@@ -59,35 +65,38 @@ router.post("/generate-upload-url", async (req, res) => {
         const uniqueFileName = `${Date.now()}-${Math.random().toString(36).substring(7)}-${filename}`;
         const key = `${folder}/${uniqueFileName}`;
 
+        console.log(`🔑 Generating S3 Key: ${key}`);
+
         const command = new PutObjectCommand({
             Bucket: process.env.AWS_BUCKET_NAME,
             Key: key,
             ContentType: fileType,
         });
 
-
+        console.log("⏳ Requesting Presigned URL from AWS S3...");
         const uploadUrl = await getSignedUrl(s3Client, command, { expiresIn: 900 });
 
-       
         const rawUrl = `https://${process.env.AWS_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${key}`;
 
+        console.log("✅ Presigned URL generated successfully!");
         res.status(200).json({
             success: true,
-            uploadUrl, 
-            rawUrl,    
+            uploadUrl,
+            rawUrl,
             key
         });
     } catch (err) {
-        console.error("Error generating presigned URL:", err);
+        console.error("❌ Error generating presigned URL:", err);
         res.status(500).json({ success: false, message: "Could not generate upload URL" });
     }
 });
 
 
 router.post("/full-upload", async (req, res) => {
-console.log("HEADERS =", req.headers);
-    console.log("CONTENT TYPE =", req.headers["content-type"]);
-    console.log("BODY =", req.body);
+    console.log("\n=======================================================");
+    console.log("📡 [POST /full-upload] API Hit!");
+    console.log("📋 HEADERS =", req.headers["content-type"]);
+    
     try {
         // Ab frontend multer (FormData) ki jagah JSON bheja karega S3 URLs ke sath
         const {
@@ -96,8 +105,11 @@ console.log("HEADERS =", req.headers);
             rawVideoUrl, rawThumbnailUrl, videoOriginalname
         } = req.body;
 
+        console.log(`📦 Parsed Body - User: ${user}, VideoUrl: ${rawVideoUrl ? "YES" : "NO"}, ThumbUrl: ${rawThumbnailUrl ? "YES" : "NO"}`);
+
         let uploaderUser = null;
 
+        console.log("🔍 Validating User in Database...");
         if (user && mongoose.isValidObjectId(user)) {
             uploaderUser = await User.findById(user).select("isSuspended").lean();
         }
@@ -107,6 +119,7 @@ console.log("HEADERS =", req.headers);
         }
 
         if (uploaderUser?.isSuspended) {
+            console.warn(`⚠️ User is suspended. Upload blocked for user: ${user || userid}`);
             return res.status(403).json({
                 success: false,
                 message: "Your account is suspended. You cannot upload videos."
@@ -118,12 +131,13 @@ console.log("HEADERS =", req.headers);
             try {
                 parsedAudioData = typeof audioData === 'string' ? JSON.parse(audioData) : audioData;
             } catch (e) {
+                console.error("❌ Error parsing audioData:", e);
                 await logError(req, e);
-                console.error("Error parsing audioData:", e);
             }
         }
 
         if (!user || !rawVideoUrl) {
+            console.warn("⚠️ Missing mandatory fields: user or rawVideoUrl");
             return res.status(400).json({
                 success: false,
                 message: "User or rawVideoUrl missing! Ensure video is uploaded to S3 first."
@@ -150,6 +164,7 @@ console.log("HEADERS =", req.headers);
         const uploaderUserDoc = await User.findById(user).select("seller_id userseller_id").lean();
 
         // Save Stub Reel immediately so user sees "Processing"
+        console.log("💾 Creating Stub Reel in Database...");
         const stubReel = new Reel({
             user,
             userid,
@@ -165,6 +180,7 @@ console.log("HEADERS =", req.headers);
             userseller_id: uploaderUserDoc?.userseller_id || "",
         });
         const savedStub = await stubReel.save();
+        console.log(`✅ Stub Reel Saved Successfully! ID: ${savedStub._id}`);
 
         // Prepare job data for background worker
         const jobData = {
@@ -186,9 +202,11 @@ console.log("HEADERS =", req.headers);
         };
 
         // Add to Redis Queue instead of processing locally
+        console.log("⚙️ Pushing job data to Redis Queue (reel-processing)...");
         await reelQueue.add('process-reel-job', jobData, { removeOnComplete: true, removeOnFail: false });
+        console.log("✅ Job successfully pushed to Queue!");
 
-        console.log("-> Job pushed to Queue. Responding with 202 Accepted.");
+        console.log("-> Responding to frontend with 202 Accepted.");
         return res.status(202).json({
             success: true,
             message: "Upload initiated. Video is queued for processing asynchronously.",
@@ -204,7 +222,7 @@ console.log("HEADERS =", req.headers);
         });
 
     } catch (err) {
-        console.error("===== [FULL UPLOAD API ERROR] =====");
+        console.error("===== ❌ [FULL UPLOAD API ERROR] =====");
         console.error(err);
         err.statusCode = err.statusCode || 500;
         await logError(req, err);
@@ -217,8 +235,10 @@ console.log("HEADERS =", req.headers);
 
 
 router.post("/", upload.single("file"), async (req, res) => {
+    console.log("\n📡 [POST /] File Upload API Hit!");
     try {
         if (!req.file) {
+            console.warn("⚠️ No file uploaded in request.");
             return res.status(400).json({
                 message: "No file uploaded",
                 success: false
@@ -226,8 +246,10 @@ router.post("/", upload.single("file"), async (req, res) => {
         }
 
         const folder = req.body.folder || "uploads";
+        console.log(`📁 Upload Target Folder: ${folder}, File Type: ${req.file.mimetype}`);
 
         if (req.file.mimetype.startsWith("video/")) {
+            console.log("🎬 Video file detected. Starting local compression...");
             const inputTmp = tmp.fileSync({ postfix: path.extname(req.file.originalname) });
             fs.writeFileSync(inputTmp.name, req.file.buffer);
 
@@ -236,9 +258,11 @@ router.post("/", upload.single("file"), async (req, res) => {
             // Note: Tumhe worker.js me bhi compressVideo rakha hai, agar yahan route me zaroorat hai toh function yahan define karna padega (jaise pehle tha)
             // But main code flow ke liye as it is rakha hai.
             await compressVideo(inputTmp.name, outputTmp.name);
+            console.log("✅ Local video compression done.");
 
             const compressedBuffer = fs.readFileSync(outputTmp.name);
 
+            console.log("📤 Uploading compressed video to S3...");
             const uploadedFileUrl = await uploadToS3(
                 { buffer: compressedBuffer, originalname: "compressed-" + req.file.originalname, mimetype: "video/mp4" },
                 folder
@@ -247,7 +271,7 @@ router.post("/", upload.single("file"), async (req, res) => {
             inputTmp.removeCallback();
             outputTmp.removeCallback();
 
-            console.log("video", uploadedFileUrl)
+            console.log("✅ Video S3 URL:", uploadedFileUrl);
             return res.status(200).json({
                 message: "Video compressed & uploaded successfully!",
                 success: true,
@@ -255,8 +279,9 @@ router.post("/", upload.single("file"), async (req, res) => {
             });
 
         } else {
+            console.log("🖼️ Image/Other file detected. Uploading to S3 directly...");
             const uploadedFileUrl = await uploadToS3(req.file, folder);
-            console.log("image", uploadedFileUrl)
+            console.log("✅ File S3 URL:", uploadedFileUrl);
 
             return res.status(200).json({
                 message: "File uploaded successfully!",
@@ -266,7 +291,7 @@ router.post("/", upload.single("file"), async (req, res) => {
         }
 
     } catch (error) {
-        console.error("Error on file upload:", error);
+        console.error("❌ Error on file upload:", error);
         error.statusCode = error.statusCode || 500;
         await logError(req, error);
         res.status(500).json({
@@ -277,22 +302,28 @@ router.post("/", upload.single("file"), async (req, res) => {
 });
 
 router.post("/upload", async (req, res) => {
+    console.log("\n📡 [POST /upload] Legacy Upload API Hit!");
     try {
         const data = await req.body;
+        console.log("📦 Request Body:", data);
 
         if (!data.user || !data.videoUrl) {
+            console.warn("⚠️ User ID or Video Url missing!");
             res.status(400).json({ message: "User ID or Video Url missing!" });
         }
 
+        console.log("💾 Saving Reel to Database...");
         const newReel = new Reel(
             data
         );
 
         const savedReel = await newReel.save();
+        console.log(`✅ Reel Saved! ID: ${savedReel._id}`);
 
         try {
             const uploaderUser = await User.findById(savedReel.user);
             if (uploaderUser && savedReel.userid) {
+                console.log("🔗 Generating short link...");
                 const { slug, shortLink } = generateShortLink(savedReel._id, savedReel.userid);
                 savedReel.shortLinks.push({
                     slug,
@@ -301,13 +332,14 @@ router.post("/upload", async (req, res) => {
                     generatedAt: new Date()
                 });
                 await savedReel.save();
-                console.log(`Short link generated and saved for reel ${savedReel._id}: ${shortLink}`);
+                console.log(`✅ Short link generated and saved for reel ${savedReel._id}: ${shortLink}`);
             }
         } catch (shortLinkError) {
-            console.warn("Failed to generate short link (non-blocking):", shortLinkError.message);
+            console.warn("⚠️ Failed to generate short link (non-blocking):", shortLinkError.message);
         }
 
         if (typeof savedReel.videoUrl === "string" && savedReel.videoUrl.toLowerCase().includes(".mp4")) {
+            console.log("🎬 MP4 detected, updating status to Processing...");
             await Reel.findByIdAndUpdate(savedReel._id, { status: "Processing" });
             // Queue ko push kar sakte ho yaha bhi agar HLS conversion karna hai
             // convertMp4UrlToHlsAndUpdateReel(savedReel._id, savedReel.videoUrl).catch(() => { });
@@ -318,6 +350,7 @@ router.post("/upload", async (req, res) => {
         }
 
         try {
+            console.log("📝 Logging user action...");
             await logUserAction({
                 user: savedReel.user,
                 action: "upload_reel",
@@ -327,13 +360,15 @@ router.post("/upload", async (req, res) => {
                 location: {
                     ip: req.headers["x-forwarded-for"] || req.socket.remoteAddress || "",
                     country: req.headers["cf-ipcountry"] || "",
-                    city: "", 
+                    city: "",
                     pincode: ""
                 }
             });
         } catch (logError) {
-            console.error("Log error (non-blocking):", logError.message);
+            console.error("⚠️ Log error (non-blocking):", logError.message);
         }
+        
+        console.log("✅ Sending final success response.");
         res.status(201).json({
             message: "Reels Saved Successfully",
             data: {
@@ -343,10 +378,10 @@ router.post("/upload", async (req, res) => {
         });
 
     } catch (error) {
+        console.error("❌ Error in upload reel:", error);
         res.status(500).json({ message: "An Error occure in Upload Reel!" });
         error.statusCode = error.statusCode || 500;
         await logError(req, error);
-        console.log("Error in upload reel", error);
     }
 });
 
@@ -372,10 +407,10 @@ router.get("/by-music/:id", async (req, res) => {
         if (currentUserId && mongoose.isValidObjectId(currentUserId)) {
             const viewer = await User.findById(currentUserId).select("blockedUsers").lean();
             const blockedList = viewer?.blockedUsers || [];
-            
+
             const blockers = await User.find({ blockedUsers: currentUserId }).select("_id").lean();
             const usersWhoBlockedMe = blockers.map(b => b._id);
-            
+
             const allBlocked = [...blockedList, ...usersWhoBlockedMe];
 
             if (allBlocked.length > 0) {
@@ -416,167 +451,167 @@ router.get("/by-music/:id", async (req, res) => {
 
 
 router.get(
-  "/",
- 
-  async (req, res) => {
-    try {
-      const page = parseInt(req.query.page) || 1;
-      const limit = parseInt(req.query.limit) || 8;
-      const search = req.query.search || "";
-      const status = req.query.status || "all";
-      const startDate = req.query.startDate || "";
-      const endDate = req.query.endDate || "";
+    "/",
 
-      const skip = (page - 1) * limit;
+    async (req, res) => {
+        try {
+            const page = parseInt(req.query.page) || 1;
+            const limit = parseInt(req.query.limit) || 8;
+            const search = req.query.search || "";
+            const status = req.query.status || "all";
+            const startDate = req.query.startDate || "";
+            const endDate = req.query.endDate || "";
 
-      // ✅ BUILD QUERY
-      const query = {};
+            const skip = (page - 1) * limit;
 
-      // 🔍 SEARCH FILTER
-      if (search) {
-        query.$or = [
-    { caption: { $regex: search, $options: "i" } },
-    { username: { $regex: search, $options: "i" } }
-  ];
-      }
+            // ✅ BUILD QUERY
+            const query = {};
 
-      // 🎯 STATUS FILTER
-      if (status !== "all") {
-        query.status = status;
-      }
+            // 🔍 SEARCH FILTER
+            if (search) {
+                query.$or = [
+                    { caption: { $regex: search, $options: "i" } },
+                    { username: { $regex: search, $options: "i" } }
+                ];
+            }
 
-      // 📅 DATE RANGE FILTER
-      if (startDate || endDate) {
-        query.createdAt = {};
+            // 🎯 STATUS FILTER
+            if (status !== "all") {
+                query.status = status;
+            }
 
-        if (startDate) {
-          query.createdAt.$gte = new Date(startDate);
+            // 📅 DATE RANGE FILTER
+            if (startDate || endDate) {
+                query.createdAt = {};
+
+                if (startDate) {
+                    query.createdAt.$gte = new Date(startDate);
+                }
+
+                if (endDate) {
+                    const end = new Date(endDate);
+                    end.setHours(23, 59, 59, 999); // full end day include
+                    query.createdAt.$lte = end;
+                }
+            }
+
+            // ✅ TOTAL COUNT (WITH FILTER)
+            const total = await Reel.countDocuments(query);
+
+            // ✅ FETCH DATA
+            const reels = await Reel.find(query)
+                .sort({ createdAt: -1 })
+                .skip(skip)
+                .limit(limit);
+
+            res.status(200).json({
+                data: reels,
+                total: total,
+                page,
+                limit,
+            });
+
+        } catch (error) {
+            console.error("Error fetching reels:", error);
+            error.statusCode = error.statusCode || 500;
+            await logError(req, error);
+            res.status(500).json({
+                message: "Error fetching reels",
+            });
         }
-
-        if (endDate) {
-          const end = new Date(endDate);
-          end.setHours(23, 59, 59, 999); // full end day include
-          query.createdAt.$lte = end;
-        }
-      }
-
-      // ✅ TOTAL COUNT (WITH FILTER)
-      const total = await Reel.countDocuments(query);
-
-      // ✅ FETCH DATA
-      const reels = await Reel.find(query)
-        .sort({ createdAt: -1 })
-        .skip(skip)
-        .limit(limit);
-
-      res.status(200).json({
-        data: reels,
-        total: total,
-        page,
-        limit,
-      });
-
-    } catch (error) {
-      console.error("Error fetching reels:", error);
-      error.statusCode = error.statusCode || 500;
-      await logError(req, error);
-      res.status(500).json({
-        message: "Error fetching reels",
-      });
     }
-  }
 );
 
 router.get(
-  "/admin_reels",
-  adminAuth,
-  checkPermission("VIEW_REELS"),
-  async (req, res) => {
-    try {
-      const page = parseInt(req.query.page) || 1;
-      const limit = parseInt(req.query.limit) || 8;
-      const search = req.query.search || "";
-      const status = req.query.status || "all";
-      const startDate = req.query.startDate || "";
-      const endDate = req.query.endDate || "";
+    "/admin_reels",
+    adminAuth,
+    checkPermission("VIEW_REELS"),
+    async (req, res) => {
+        try {
+            const page = parseInt(req.query.page) || 1;
+            const limit = parseInt(req.query.limit) || 8;
+            const search = req.query.search || "";
+            const status = req.query.status || "all";
+            const startDate = req.query.startDate || "";
+            const endDate = req.query.endDate || "";
 
-      const skip = (page - 1) * limit;
+            const skip = (page - 1) * limit;
 
-      // ✅ BUILD QUERY
-      const query = {};
+            // ✅ BUILD QUERY
+            const query = {};
 
-      // 🔥 1. DEFAULT FILTER: Hamesha Deleted Users ki reels hide karo
-      // Iske liye ab frontend se 'activeUsersOnly' bhejne ki zaroorat nahi hai.
-      const activeUsers = await User.find({ isDeleted: { $ne: true } }).select("_id");
-      const activeUserIds = activeUsers.map(user => user._id);
-      
-      // Reel sirf active users ki hi aayegi
-      query.user = { $in: activeUserIds };
+            // 🔥 1. DEFAULT FILTER: Hamesha Deleted Users ki reels hide karo
+            // Iske liye ab frontend se 'activeUsersOnly' bhejne ki zaroorat nahi hai.
+            const activeUsers = await User.find({ isDeleted: { $ne: true } }).select("_id");
+            const activeUserIds = activeUsers.map(user => user._id);
 
-      // 🔥 2. DEFAULT FILTER: Hamesha Soft Deleted Reels ko hide karo
-      // Agar aap status explicitly "deleted" bhejte ho tabhi dikhega
-      if (status === "deleted") {
-        query.isDeleted = true;
-      } else {
-        query.isDeleted = { $ne: true }; 
-      }
+            // Reel sirf active users ki hi aayegi
+            query.user = { $in: activeUserIds };
 
-      // 🔍 3. SEARCH FILTER
-      if (search) {
-        query.$or = [
-          { caption: { $regex: search, $options: "i" } },
-          { username: { $regex: search, $options: "i" } }
-        ];
-      }
+            // 🔥 2. DEFAULT FILTER: Hamesha Soft Deleted Reels ko hide karo
+            // Agar aap status explicitly "deleted" bhejte ho tabhi dikhega
+            if (status === "deleted") {
+                query.isDeleted = true;
+            } else {
+                query.isDeleted = { $ne: true };
+            }
 
-      // 🎯 4. STATUS FILTER (Agar status 'deleted' ya 'all' ke alawa kuch aur hai jaise 'active')
-      if (status !== "all" && status !== "deleted") {
-        query.status = status;
-      }
+            // 🔍 3. SEARCH FILTER
+            if (search) {
+                query.$or = [
+                    { caption: { $regex: search, $options: "i" } },
+                    { username: { $regex: search, $options: "i" } }
+                ];
+            }
 
-      // 📅 5. DATE RANGE FILTER
-      if (startDate || endDate) {
-        query.createdAt = {};
+            // 🎯 4. STATUS FILTER (Agar status 'deleted' ya 'all' ke alawa kuch aur hai jaise 'active')
+            if (status !== "all" && status !== "deleted") {
+                query.status = status;
+            }
 
-        if (startDate) {
-          query.createdAt.$gte = new Date(startDate);
+            // 📅 5. DATE RANGE FILTER
+            if (startDate || endDate) {
+                query.createdAt = {};
+
+                if (startDate) {
+                    query.createdAt.$gte = new Date(startDate);
+                }
+
+                if (endDate) {
+                    const end = new Date(endDate);
+                    end.setHours(23, 59, 59, 999); // full end day include
+                    query.createdAt.$lte = end;
+                }
+            }
+
+            // ✅ TOTAL COUNT (WITH FILTER)
+            const total = await Reel.countDocuments(query);
+
+            // ✅ FETCH DATA
+            const reels = await Reel.find(query)
+                .sort({ createdAt: -1 })
+                .skip(skip)
+                .limit(limit);
+
+            res.status(200).json({
+                data: reels,
+                total: total,
+                page,
+                limit,
+            });
+
+        } catch (error) {
+            console.error("Error fetching reels:", error);
+            error.statusCode = error.statusCode || 500;
+            await logError(req, error);
+            res.status(500).json({
+                message: "Error fetching reels",
+            });
         }
-
-        if (endDate) {
-          const end = new Date(endDate);
-          end.setHours(23, 59, 59, 999); // full end day include
-          query.createdAt.$lte = end;
-        }
-      }
-
-      // ✅ TOTAL COUNT (WITH FILTER)
-      const total = await Reel.countDocuments(query);
-
-      // ✅ FETCH DATA
-      const reels = await Reel.find(query)
-        .sort({ createdAt: -1 })
-        .skip(skip)
-        .limit(limit);
-
-      res.status(200).json({
-        data: reels,
-        total: total,
-        page,
-        limit,
-      });
-
-    } catch (error) {
-      console.error("Error fetching reels:", error);
-      error.statusCode = error.statusCode || 500;
-      await logError(req, error);
-      res.status(500).json({
-        message: "Error fetching reels",
-      });
     }
-  }
 );
 
-router.get("/shownew", async (req, res) => { 
+router.get("/shownew", async (req, res) => {
     try {
         const limit = parseInt(req.query.limit || "2", 10);
         // Exclude logic as it is
@@ -597,7 +632,7 @@ router.get("/shownew", async (req, res) => {
 
         if (mongoose.isValidObjectId(currentUserId)) {
             const viewer = await User.findById(currentUserId).select("blockedUsers isDeleted").lean();
-            
+
             if (viewer && viewer.isDeleted) {
                 return res.status(403).json({ message: "Your account is deleted. Access denied." });
             }
@@ -605,20 +640,20 @@ router.get("/shownew", async (req, res) => {
             const blockedList = viewer?.blockedUsers || [];
             const blockers = await User.find({ blockedUsers: currentUserId }).select("_id").lean();
             const usersWhoBlockedMe = blockers.map(b => b._id);
-            
+
             const allExcludedUsers = [...blockedList, ...usersWhoBlockedMe];
             if (allExcludedUsers.length > 0) {
-                matchStage.user = { $nin: allExcludedUsers }; 
+                matchStage.user = { $nin: allExcludedUsers };
             }
 
             const notInterestedInteractions = await ReelInteraction.find({
                 user: currentUserId,
                 action: "not_interested"
             })
-            .select("reel")
-            .sort({ createdAt: -1 })
-            .limit(200) 
-            .lean();
+                .select("reel")
+                .sort({ createdAt: -1 })
+                .limit(200)
+                .lean();
 
             if (notInterestedInteractions.length > 0) {
                 const notInterestedReelIds = notInterestedInteractions.map(interaction => interaction.reel);
@@ -638,9 +673,9 @@ router.get("/shownew", async (req, res) => {
 
         // 🔥 NAYA FIX: Mongoose Populate (Fast aur Bulletproof) 🔥
         // Yeh sirf ek query me saare reel owners ka data le aayega bina strict format mismatch ke
-        await User.populate(reels, { 
-            path: "user", 
-            select: "profilePicture followers seller_id userseller_id" 
+        await User.populate(reels, {
+            path: "user",
+            select: "profilePicture followers seller_id userseller_id"
         });
 
         // 👤 Fetch current user's profile picture
@@ -652,7 +687,7 @@ router.get("/shownew", async (req, res) => {
         const reelsWithFollow = reels.map((reel) => {
             // Populate hone ke baad `reel.user` ab ek puri object ban chuka hai
             const owner = (reel.user && reel.user._id) ? reel.user : {};
-            
+
             // Followers check karo
             let isFollowing = false;
             if (owner.followers && Array.isArray(owner.followers)) {
@@ -660,9 +695,9 @@ router.get("/shownew", async (req, res) => {
             }
 
             return {
-                ...reel, 
+                ...reel,
                 // Frontend ko ID ki aadat hai, toh object hata kar wapas string ID set kar di
-                user: owner._id ? owner._id.toString() : reel.user, 
+                user: owner._id ? owner._id.toString() : reel.user,
                 isFollowing: isFollowing,
                 currentUserProfilePic,
                 reelUserProfilePic: owner.profilePicture || "", // 👈 Photo ab yahan se 100% milegi
@@ -714,7 +749,7 @@ router.post("/view", async (req, res) => {
 
             if (hasOwnerBlockedViewer || hasViewerBlockedOwner) {
                 // View ko silently ignore kar diya taaki frontend player crash na ho
-                return res.status(200).json({ message: "View ignored due to privacy" }); 
+                return res.status(200).json({ message: "View ignored due to privacy" });
             }
         }
         // 🔥 ADDED: MUTUAL BLOCK CHECK END 🔥
@@ -940,10 +975,10 @@ router.get("/others/:userId", async (req, res) => {
         if (currentUserId && mongoose.isValidObjectId(currentUserId)) {
             const viewer = await User.findById(currentUserId).select("blockedUsers").lean();
             const blockedList = viewer?.blockedUsers || [];
-            
+
             const blockers = await User.find({ blockedUsers: currentUserId }).select("_id").lean();
             const usersWhoBlockedMe = blockers.map(b => b._id);
-            
+
             const allBlocked = [...blockedList, ...usersWhoBlockedMe];
 
             if (allBlocked.length > 0) {
@@ -951,7 +986,7 @@ router.get("/others/:userId", async (req, res) => {
                     // Agar specific profile dekh rahe hain, aur wo block hai, toh seedha empty return
                     const isBlocked = allBlocked.some(bid => bid.toString() === query.user.toString());
                     if (isBlocked) {
-                        return res.status(200).json([]); 
+                        return res.status(200).json([]);
                     }
                 } else {
                     // Agar Liked ya Music reels dekh rahe hain, toh blocked owners ki reels nikal do
@@ -962,40 +997,40 @@ router.get("/others/:userId", async (req, res) => {
         // 🔥 ADDED: MUTUAL BLOCK FILTER LOGIC END 🔥
 
         if (currentUserId && mongoose.isValidObjectId(currentUserId)) {
-    const notInterested = await ReelInteraction.find({
-        user: new mongoose.Types.ObjectId(currentUserId),
-        action: "not_interested"
-    }).select("reel").lean();
+            const notInterested = await ReelInteraction.find({
+                user: new mongoose.Types.ObjectId(currentUserId),
+                action: "not_interested"
+            }).select("reel").lean();
 
-    if (notInterested.length > 0) {
-        const notInterestedIds = notInterested.map(
-            i => new mongoose.Types.ObjectId(i.reel)
-        );
+            if (notInterested.length > 0) {
+                const notInterestedIds = notInterested.map(
+                    i => new mongoose.Types.ObjectId(i.reel)
+                );
 
-        if (query._id) {
-            query._id = {
-                ...query._id,
-                $nin: [...(query._id.$nin || []), ...notInterestedIds]
-            };
-        } else {
-            query._id = { $nin: notInterestedIds };
+                if (query._id) {
+                    query._id = {
+                        ...query._id,
+                        $nin: [...(query._id.$nin || []), ...notInterestedIds]
+                    };
+                } else {
+                    query._id = { $nin: notInterestedIds };
+                }
+            }
         }
-    }
-}
 
-      // 🚫 Exclude a reel (for infinite scroll) — FIXED
-if (excludeId) {
-    const excludeObjectId = new mongoose.Types.ObjectId(excludeId);
+        // 🚫 Exclude a reel (for infinite scroll) — FIXED
+        if (excludeId) {
+            const excludeObjectId = new mongoose.Types.ObjectId(excludeId);
 
-    if (query._id) {
-        query._id = {
-            ...query._id,
-            $ne: excludeObjectId
-        };
-    } else {
-        query._id = { $ne: excludeObjectId };
-    }
-}
+            if (query._id) {
+                query._id = {
+                    ...query._id,
+                    $ne: excludeObjectId
+                };
+            } else {
+                query._id = { $ne: excludeObjectId };
+            }
+        }
 
         // 📦 Fetch reels
         const reels = await Reel.find(query)
@@ -1113,18 +1148,18 @@ router.delete("/delete/:reelId/:userid", async (req, res) => {
     } catch (error) {
         console.error("Delete reel error:", error);
         // Fallback status code if error.statusCode is undefined
-        const statusCode = error.statusCode || 500; 
-        
+        const statusCode = error.statusCode || 500;
+
         // Log error if the function exists
         if (typeof logError === 'function') {
             await logError(req, error);
         }
-        
+
         return res.status(statusCode).json({ message: "Error deleting reel" });
     }
 });
 
-router.delete("/admin_delete/:reelId/:userid",adminAuth,
+router.delete("/admin_delete/:reelId/:userid", adminAuth,
     checkPermission("DELETE_REEL"), async (req, res) => {
         try {
             const { reelId, userid } = req.params;
@@ -1243,6 +1278,9 @@ router.put("/update/:id", async (req, res) => {
 
 // Like or Unlike a Reel
 router.put("/like/:id", async (req, res) => {
+    console.log("========== LIKE API ==========");
+    console.log("BODY:", req.body);
+    console.log("REEL ID:", req.params.id);
     try {
         const { userId } = req.body; // who is liking
         const reelId = req.params.id;
@@ -1251,6 +1289,10 @@ router.put("/like/:id", async (req, res) => {
 
         // ✅ Fetch user
         const user = await User.findById(userId);
+        console.log("========== USER ==========");
+        console.log("User ObjectId:", user?._id);
+        console.log("User UserId:", user?.userid);
+        console.log("User Suspended:", user?.isSuspended);
         if (!user) return res.status(404).json({ message: "User not found" });
         if (!user.userid) return res.status(500).json({ message: "User.userid missing" });
 
@@ -1263,13 +1305,18 @@ router.put("/like/:id", async (req, res) => {
 
         // ✅ Fetch reel
         const reel = await Reel.findById(reelId);
+        console.log("========== REEL ==========");
+        console.log("Reel ObjectId:", reel?._id);
+        console.log("Reel Owner ObjectId:", reel?.user);
+        console.log("Reel Owner UserId:", reel?.userid);
+        console.log("Likes Before:", reel?.likes);
         if (!reel) return res.status(404).json({ message: "Reel not found" });
         if (!reel.userid) return res.status(500).json({ message: "Reel.userid missing" });
 
         // 🔥 ADDED: MUTUAL BLOCK CHECK START 🔥
         if (reel.user) {
             const owner = await User.findById(reel.user).select("blockedUsers").lean();
-            
+
             const hasOwnerBlockedViewer = owner?.blockedUsers?.some(bid => bid.toString() === userId.toString());
             const hasViewerBlockedOwner = user.blockedUsers?.some(bid => bid.toString() === reel.user.toString());
 
@@ -1280,12 +1327,14 @@ router.put("/like/:id", async (req, res) => {
         // 🔥 ADDED: MUTUAL BLOCK CHECK END 🔥
 
         const alreadyLiked = reel.likes.includes(userId);
-
+        console.log("========== LIKE STATUS ==========");
+        console.log("Already Liked:", alreadyLiked);
         if (alreadyLiked) {
             // ❌ UNLIKE (NO NOTIFICATION)
+            console.log("👉 UNLIKE FLOW");
             reel.likes = reel.likes.filter(id => id.toString() !== userId);
             await reel.save();
-
+            console.log("Returning Response: Reel unliked");
             return res.status(200).json({
                 message: "Reel unliked",
                 likes: reel.likes.length
@@ -1297,7 +1346,9 @@ router.put("/like/:id", async (req, res) => {
             await reel.save();
 
             // 🔔 CREATE LIKE NOTIFICATION
+            console.log("========== NOTIFICATION ==========");
             try {
+
                 console.log("Creating like notification:", {
                     recipientUserId: reel.userid,
                     senderUserId: user.userid,
@@ -1314,10 +1365,11 @@ router.put("/like/:id", async (req, res) => {
                     reel: reelId,
                     message: "liked your reel"
                 });
-
+                console.log("✅ Notification Function Completed");
             } catch (notifError) {
                 console.error("Like notification failed:", notifError.message);
             }
+            console.log("Returning Response: Reel liked");
 
             return res.status(200).json({
                 message: "Reel liked",
@@ -1334,7 +1386,7 @@ router.put("/like/:id", async (req, res) => {
 });
 
 // return total likes of all users
-router.get("/totallikes",adminAuth ,  async (req, res) => {
+router.get("/totallikes", adminAuth, async (req, res) => {
     try {
         // Sirf likes field uthao (fast)
         const reels = await Reel.find({}, "likes");
@@ -1357,7 +1409,7 @@ router.get("/totallikes",adminAuth ,  async (req, res) => {
 });
 
 // return this api total views of all users
-router.get("/totalviews",adminAuth ,  async (req, res) => {
+router.get("/totalviews", adminAuth, async (req, res) => {
     try {
         // Sirf views field uthao (fast query)
         const reels = await Reel.find({}, "views");
@@ -1380,84 +1432,84 @@ router.get("/totalviews",adminAuth ,  async (req, res) => {
 });
 
 
-router.put("/block/:id",   async (req, res) => {
-        try {
-            const { id } = req.params;
-            const { action, reason } = req.body;
-            // action = "block" | "unblock"
+router.put("/block/:id", async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { action, reason } = req.body;
+        // action = "block" | "unblock"
 
-            if (!mongoose.isValidObjectId(id)) {
-                return res.status(400).json({ message: "Invalid reel id" });
-            }
-
-            if (!["block", "unblock"].includes(action)) {
-                return res.status(400).json({ message: "Invalid action" });
-            }
-
-            let updateData = {};
-
-            if (action === "block") {
-                updateData = {
-                    status: "Blocked",
-                    blockedAt: new Date(),                 // ✅ auto time
-                    blockReason: reason || "Policy violation"
-                };
-            } else {
-                updateData = {
-                    status: "Published",
-                    blockedAt: null,                       // ✅ reset
-                    blockReason: null
-                };
-            }
-
-            const reel = await Reel.findByIdAndUpdate(
-                id,
-                updateData,
-                { new: true }
-            );
-            try {
-                await logUserAction({
-                    user: req.user._id,
-                    userName: req.userName,
-                    userRole: req.userRole,
-
-                    action: action === "block" ? "block_reel" : "unblock_reel",
-
-                    targetType: "Reel",
-                    targetId: reel._id,
-                    targetName: `Reel ID: ${reel._id}`,
-                    device: req.headers["user-agent"],
-                    location: {
-                        ip:
-                            req.headers["x-forwarded-for"] ||
-                            req.socket.remoteAddress ||
-                            "",
-                        country: req.headers["cf-ipcountry"] || "",
-                    },
-                });
-            } catch (e) {
-                console.error("Log error:", e.message);
-            }
-            if (!reel) {
-                return res.status(404).json({ message: "Reel not found" });
-            }
-
-            return res.status(200).json({
-                success: true,
-                message: `Reel ${action === "block" ? "blocked" : "unblocked"} successfully`,
-                reel
-            });
-
-        } catch (error) {
-            console.error("Error blocking/unblocking reel:", error);
-            error.statusCode = error.statusCode || 500;
-            await logError(req, error);
-            res.status(500).json({ message: "Server error" });
+        if (!mongoose.isValidObjectId(id)) {
+            return res.status(400).json({ message: "Invalid reel id" });
         }
-    });
+
+        if (!["block", "unblock"].includes(action)) {
+            return res.status(400).json({ message: "Invalid action" });
+        }
+
+        let updateData = {};
+
+        if (action === "block") {
+            updateData = {
+                status: "Blocked",
+                blockedAt: new Date(),                 // ✅ auto time
+                blockReason: reason || "Policy violation"
+            };
+        } else {
+            updateData = {
+                status: "Published",
+                blockedAt: null,                       // ✅ reset
+                blockReason: null
+            };
+        }
+
+        const reel = await Reel.findByIdAndUpdate(
+            id,
+            updateData,
+            { new: true }
+        );
+        try {
+            await logUserAction({
+                user: req.user._id,
+                userName: req.userName,
+                userRole: req.userRole,
+
+                action: action === "block" ? "block_reel" : "unblock_reel",
+
+                targetType: "Reel",
+                targetId: reel._id,
+                targetName: `Reel ID: ${reel._id}`,
+                device: req.headers["user-agent"],
+                location: {
+                    ip:
+                        req.headers["x-forwarded-for"] ||
+                        req.socket.remoteAddress ||
+                        "",
+                    country: req.headers["cf-ipcountry"] || "",
+                },
+            });
+        } catch (e) {
+            console.error("Log error:", e.message);
+        }
+        if (!reel) {
+            return res.status(404).json({ message: "Reel not found" });
+        }
+
+        return res.status(200).json({
+            success: true,
+            message: `Reel ${action === "block" ? "blocked" : "unblocked"} successfully`,
+            reel
+        });
+
+    } catch (error) {
+        console.error("Error blocking/unblocking reel:", error);
+        error.statusCode = error.statusCode || 500;
+        await logError(req, error);
+        res.status(500).json({ message: "Server error" });
+    }
+});
 
 
- router.put("/admin_block/:id", adminAuth,
+router.put("/admin_block/:id", adminAuth,
     checkPermission("BLOCK_REEL"), async (req, res) => {
         try {
             const { id } = req.params;
@@ -1534,7 +1586,7 @@ router.put("/block/:id",   async (req, res) => {
         }
     });
 
-router.get("/admin/users/:userid/liked-reels", adminAuth ,  async (req, res) => {
+router.get("/admin/users/:userid/liked-reels", adminAuth, async (req, res) => {
     try {
         const { userid } = req.params;
 
@@ -1581,7 +1633,7 @@ router.get("/admin/users/:userid/liked-reels", adminAuth ,  async (req, res) => 
 });
 
 
-router.get("/users/:userId/music", adminAuth , async (req, res) => {
+router.get("/users/:userId/music", adminAuth, async (req, res) => {
     try {
         const { userId } = req.params;
         const page = Number(req.query.page) || 1;

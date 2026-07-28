@@ -23,17 +23,20 @@ const { uploadToS3, s3 } = require("./lib/s3"); // S3 client aur upload function
 const { generateShortLink } = require("./utils/shortLink");
 
 // DB Connection
+console.log("🔄 Trying to connect to MongoDB...");
 mongoose.connect(process.env.MONGO_URI)
-    .then(() => console.log("Worker connected to MongoDB"))
-    .catch(err => console.error("Worker DB Connection Error:", err));
+    .then(() => console.log("✅ Worker connected to MongoDB"))
+    .catch(err => console.error("❌ Worker DB Connection Error:", err));
 
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 ffmpeg.setFfprobePath(ffprobeStatic.path);
+console.log("🎬 FFmpeg paths configured successfully.");
 
 // =================================================================
 // === FFMPEG & DOWNLOAD HELPERS ===
 // =================================================================
 async function compressVideo(inputPath, outputPath) {
+    console.log(`🎬 [compressVideo] Started for ${inputPath}`);
     const metadata = await new Promise((resolve, reject) => {
         ffmpeg.ffprobe(inputPath, (err, data) => { if (err) return reject(err); resolve(data); });
     });
@@ -55,14 +58,16 @@ async function compressVideo(inputPath, outputPath) {
         ffmpeg(inputPath).videoFilters(scaleFilter).outputOptions([
             "-c:v libx264", `-b:v ${bps}k`, `-maxrate ${bps}k`, `-bufsize ${bps * 2}k`, `-crf ${crf}`,
             "-preset veryfast", "-c:a aac", "-b:a 128k", "-movflags +faststart", "-y"
-        ]).save(outputPath).on("end", resolve).on("error", reject);
+        ]).save(outputPath)
+          .on("end", () => { console.log("✅ [compressVideo] Completed!"); resolve(); })
+          .on("error", (err) => { console.error("❌ [compressVideo] Error:", err); reject(err); });
     });
 }
 
 function getAudioDuration(filePath) {
     return new Promise((resolve, reject) => {
         ffmpeg.ffprobe(filePath, (err, metadata) => {
-            if (err) return reject(err);
+            if (err) { console.error("❌ [getAudioDuration] Error:", err); return reject(err); }
             const duration = metadata?.format?.duration;
             if (duration && !isNaN(parseFloat(duration))) resolve(Math.round(parseFloat(duration)));
             else resolve(0);
@@ -73,7 +78,7 @@ function getAudioDuration(filePath) {
 function getMediaDurationSec(filePath) {
     return new Promise((resolve, reject) => {
         ffmpeg.ffprobe(filePath, (err, metadata) => {
-            if (err) return reject(err);
+            if (err) { console.error("❌ [getMediaDurationSec] Error:", err); return reject(err); }
             const duration = parseFloat(metadata?.format?.duration);
             resolve(Number.isFinite(duration) && duration > 0 ? duration : 0);
         });
@@ -92,6 +97,7 @@ function sanitizeCdnUrl(url) {
 }
 
 async function muxMusicOverVideo({ videoPath, audioPath, outputPath, musicStartSec = 0, durationSec, musicVolume = 1, originalVolume = 0 }) {
+    console.log(`🎵 [muxMusicOverVideo] Muxing started. Video: ${videoPath}, Audio: ${audioPath}`);
     const dur = Math.max(0.1, durationSec);
     const seek = Math.max(0, musicStartSec);
     const seekStr = seek.toFixed(3); const durStr = dur.toFixed(3);
@@ -108,32 +114,55 @@ async function muxMusicOverVideo({ videoPath, audioPath, outputPath, musicStartS
             cmd.complexFilter([`${trimmedMusic}[aout]`]);
         }
         cmd.outputOptions([ "-map", "0:v:0", "-map", "[aout]", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", "-y" ]);
-        cmd.save(outputPath).on("end", resolve).on("error", reject);
+        cmd.save(outputPath)
+           .on("end", () => { console.log("✅ [muxMusicOverVideo] Muxing completed!"); resolve(); })
+           .on("error", (err) => { console.error("❌ [muxMusicOverVideo] Error:", err); reject(err); });
     });
 }
 
 async function downloadFileToTemp(url, ext = '.tmp') {
+    console.log(`📥 [downloadFileToTemp] Starting download for: ${url.substring(0, 50)}...`);
     const MAX_REDIRECTS = 5; let redirects = 0; let currentUrl = url;
     const tmpFile = tmp.fileSync({ postfix: ext });
     return new Promise((resolve, reject) => {
         function getFile(fileUrl) {
-            if (redirects >= MAX_REDIRECTS) { tmpFile.removeCallback(); return reject(new Error('Exceeded maximum redirects.')); }
+            if (redirects >= MAX_REDIRECTS) { 
+                tmpFile.removeCallback(); 
+                console.error("❌ [downloadFileToTemp] Exceeded maximum redirects.");
+                return reject(new Error('Exceeded maximum redirects.')); 
+            }
             const getter = (fileUrl.startsWith("http://") ? http : https);
             getter.get(fileUrl, (response) => {
                 const statusCode = response.statusCode;
                 if (statusCode >= 300 && statusCode < 400 && response.headers.location) {
                     redirects++; currentUrl = new URL(response.headers.location, fileUrl).href; 
+                    console.log(`🔄 [downloadFileToTemp] Redirecting to: ${currentUrl.substring(0, 50)}...`);
                     response.resume(); return getFile(currentUrl); 
                 }
                 if (statusCode === 200) {
                     const file = fs.createWriteStream(tmpFile.name);
                     response.pipe(file);
-                    file.on("finish", () => { file.close(() => resolve(tmpFile)); });
-                    file.on("error", (err) => { tmpFile.removeCallback(); reject(err); });
+                    file.on("finish", () => { 
+                        file.close(() => {
+                            console.log(`✅ [downloadFileToTemp] Download finished. Saved at: ${tmpFile.name}`);
+                            resolve(tmpFile);
+                        }); 
+                    });
+                    file.on("error", (err) => { 
+                        tmpFile.removeCallback(); 
+                        console.error("❌ [downloadFileToTemp] File write error:", err);
+                        reject(err); 
+                    });
                     return;
                 }
-                tmpFile.removeCallback(); return reject(new Error(`Failed to download file, Status Code: ${statusCode}`));
-            }).on("error", (err) => { tmpFile.removeCallback(); reject(err); });
+                tmpFile.removeCallback(); 
+                console.error(`❌ [downloadFileToTemp] Failed with Status Code: ${statusCode}`);
+                return reject(new Error(`Failed to download file, Status Code: ${statusCode}`));
+            }).on("error", (err) => { 
+                tmpFile.removeCallback(); 
+                console.error("❌ [downloadFileToTemp] HTTP request error:", err);
+                reject(err); 
+            });
         }
         getFile(currentUrl);
     });
@@ -143,7 +172,9 @@ async function downloadFileToTemp(url, ext = '.tmp') {
 // === 3. CORE WORKER PROCESSING FUNCTION ===
 // =================================================================
 async function processReelUpload(jobData) {
-    console.log(`===== [WORKER: FULL UPLOAD JOB STARTED for user ${jobData.userid}] =====`);
+    console.log(`\n======================================================`);
+    console.log(`🚀 [WORKER: FULL UPLOAD JOB STARTED for user ${jobData.userid}]`);
+    console.log(`🔍 [JOB DATA RECIEVED] Reel ID: ${jobData.reelId}, RawVideoUrl: ${jobData.rawVideoUrl ? "YES" : "NO"}`);
     
     const { rawVideoUrl, rawThumbnailUrl, videoOriginalname, reelId: existingReelId, externalAudioData, ...reelMetadata } = jobData;
     
@@ -163,13 +194,19 @@ async function processReelUpload(jobData) {
 
     try {
         if (newReelId) {
+            console.log(`🔍 Fetching stub reel from DB: ${newReelId}`);
             savedReel = await Reel.findById(newReelId);
-            if (!savedReel) throw new Error(`Reel stub not found: ${newReelId}`);
+            if (!savedReel) {
+                console.error(`❌ Reel stub not found in DB: ${newReelId}`);
+                throw new Error(`Reel stub not found: ${newReelId}`);
+            }
+            console.log(`✅ Stub reel found in DB.`);
         }
 
-        console.log("-> Downloading Raw Video from S3...");
+        console.log("-> 📥 Downloading Raw Video from S3...");
         const inputTmp = await downloadFileToTemp(rawVideoUrl, path.extname(videoOriginalname) || ".mp4");
         tempFiles.push(inputTmp);
+        console.log(`✅ Raw Video downloaded to: ${inputTmp.name}`);
 
         const outputTmp = tmp.fileSync({ postfix: ".mp4" });
         tempFiles.push(outputTmp);
@@ -177,16 +214,21 @@ async function processReelUpload(jobData) {
         let videoToCompressPath = inputTmp.name;
         const videoStartMs = parseFloat(videoStartTime);
         const videoEndMs = parseFloat(videoEndTime);
+        
+        console.log(`⏱️ Video Trim Info: Start=${videoStartMs}ms, End=${videoEndMs}ms`);
         if (Number.isFinite(videoStartMs) && Number.isFinite(videoEndMs)) {
             const startSec = videoStartMs / 1000;
             const dur = (videoEndMs - videoStartMs) / 1000;
             if (dur > 0) {
+                console.log(`✂️ Trimming video... Start: ${startSec}s, Duration: ${dur}s`);
                 const trimmedTmp = tmp.fileSync({ postfix: ".mp4" });
                 tempFiles.push(trimmedTmp);
                 await new Promise((resolve, reject) => {
                     ffmpeg(inputTmp.name).seekInput(startSec).duration(dur)
                         .outputOptions(["-c", "copy", "-y"])
-                        .save(trimmedTmp.name).on("end", resolve).on("error", reject);
+                        .save(trimmedTmp.name)
+                        .on("end", () => { console.log("✅ Video trim complete."); resolve(); })
+                        .on("error", (err) => { console.error("❌ Video trim error:", err); reject(err); });
                 });
                 videoToCompressPath = trimmedTmp.name;
             }
@@ -202,32 +244,39 @@ async function processReelUpload(jobData) {
         let audioDuration = 0; 
 
         if (externalAudioData && externalAudioData.url && (!musicId || !mongoose.Types.ObjectId.isValid(musicId))) {
-            console.log("[STEP 3.0] Processing external audio data from body (new Music track)...");
+            console.log("[STEP 3.0] 🎵 Processing external audio data from body (new Music track)...");
             try {
                 const title = externalAudioData.title || "External Sound";
                 const artist = externalAudioData.artist || "Unknown Artist";
+                console.log(`🔍 Checking if music exists in DB: Title="${title}", Artist="${artist}"`);
                 const existingMusic = await Music.findOne({ title, artist });
 
                 if (existingMusic) {
+                    console.log(`✅ Existing music found in DB. ID: ${existingMusic._id}`);
                     finalMusicId = existingMusic._id;
                     shouldReplaceAudio = true;
                     const ext = path.extname(existingMusic.url) || '.mp3';
+                    console.log("📥 Downloading existing music file...");
                     const musicTmpObj = await downloadFileToTemp(existingMusic.url, ext);
                     tempFiles.push(musicTmpObj);
                     audioInputPath = musicTmpObj.name;  
                 } else {
+                    console.log("🆕 New external music detected. Downloading...");
                     const ext = path.extname(new URL(externalAudioData.url).pathname) || '.mp3';
                     const musicTmpObj = await downloadFileToTemp(externalAudioData.url, ext);
                     tempFiles.push(musicTmpObj);
                     audioInputPath = musicTmpObj.name;
                     audioDuration = await getAudioDuration(audioInputPath);
 
+                    console.log("📤 Uploading new external music to S3...");
                     const audioBuffer = fs.readFileSync(audioInputPath);
                     const audioUploadResult = await uploadToS3(
                         { buffer: audioBuffer, originalname: `external-sound-${userid}-${Date.now()}${ext}`, mimetype: ext === '.mp3' ? "audio/mp3" : "audio/mpeg" },
                         `audio`
                     );
+                    console.log(`✅ New external music uploaded to S3: ${audioUploadResult}`);
 
+                    console.log("💾 Saving new music doc to DB...");
                     const newMusic = new Music({
                         title, artist, url: audioUploadResult, duration: audioDuration,
                         uploadedBy: user, thumbnail: externalAudioData.artwork || "",
@@ -235,25 +284,30 @@ async function processReelUpload(jobData) {
                     const savedMusic = await newMusic.save();
                     finalMusicId = savedMusic._id;
                     shouldReplaceAudio = true;
+                    console.log(`✅ New music saved. ID: ${finalMusicId}`);
                 }
             } catch (e) {
-                console.warn("[WARNING] External audio failed:", e.message);
+                console.warn("⚠️ [WARNING] External audio failed:", e.message);
                 audioInputPath = null; finalMusicId = musicId || null;
             }
         }
 
         if (!shouldReplaceAudio && finalMusicId && mongoose.Types.ObjectId.isValid(finalMusicId)) {
+            console.log(`🔍 Checking provided musicId: ${finalMusicId}`);
             const musicDoc = await Music.findById(finalMusicId);
             if (musicDoc?.url) {
+                console.log("📥 Downloading requested music file from existing ID...");
                 const ext = path.extname(musicDoc.url) || '.mp3';
                 const musicTmpObj = await downloadFileToTemp(musicDoc.url, ext);
                 tempFiles.push(musicTmpObj);
                 audioInputPath = musicTmpObj.name;
                 shouldReplaceAudio = true;
+                console.log("✅ Music file downloaded.");
             }
         }
         
         if (shouldReplaceAudio) {
+            console.log("🔀 Replacing/Muxing audio into video...");
             const replacedTmp = tmp.fileSync({ postfix: ".mp4" });
             tempFiles.push(replacedTmp);
             const videoDurationSec = await getMediaDurationSec(outputTmp.name);
@@ -263,57 +317,91 @@ async function processReelUpload(jobData) {
             if (musicEndMs > musicStartMs) {
                 muxDurationSec = Math.min(videoDurationSec, (musicEndMs - musicStartMs) / 1000);
             }
+            console.log(`🎵 Mux info - MusicStart: ${musicStartMs}ms, MuxDuration: ${muxDurationSec}s`);
             await muxMusicOverVideo({
                 videoPath: outputTmp.name, audioPath: audioInputPath, outputPath: replacedTmp.name,
                 musicStartSec: musicStartMs / 1000, durationSec: muxDurationSec, musicVolume: musicVol, originalVolume: originalVol,
             });
             videoFileWithFinalAudioPath = replacedTmp.name;
         } else {
-            const extractedAudioTmp = tmp.fileSync({ postfix: ".mp3" });
-            tempFiles.push(extractedAudioTmp);
-            await new Promise((resolve, reject) => {
-                ffmpeg(outputTmp.name).outputOptions(["-vn", "-c:a libmp3lame", "-b:a 128k", "-y"])
-                    .save(extractedAudioTmp.name).on("end", resolve).on("error", reject);
+            console.log("🎧 No external audio replace requested. Checking for original audio stream...");
+            
+            // 🔥 FIXED LOGIC: Pehle check karo ki video mein audio track hai ya nahi
+            const hasAudio = await new Promise((resolve) => {
+                ffmpeg.ffprobe(outputTmp.name, (err, metadata) => {
+                    if (err) {
+                        resolve(false);
+                    } else {
+                        // Check if streams exist and find audio
+                        const audioStream = metadata.streams && metadata.streams.find(s => s.codec_type === 'audio');
+                        resolve(!!audioStream);
+                    }
+                });
             });
-            const audioBuffer = fs.readFileSync(extractedAudioTmp.name);
-            const audioUploadResult = await uploadToS3(
-                { buffer: audioBuffer, originalname: `original-sound-${userid}-${Date.now()}.mp3`, mimetype: "audio/mp3" }, `audio`
-            );
-            let originalAudioDuration = 0;
-            const videoDurationMs = (parseFloat(videoEndTime) - parseFloat(videoStartTime));
-            if (!isNaN(videoDurationMs) && videoDurationMs > 0) originalAudioDuration = Math.round(videoDurationMs / 1000);
 
-            const newMusic = new Music({
-                title: caption ? `${caption.substring(0, 50)}... (Original Sound)` : "Original Video Sound",
-                artist: name || username || 'Unknown User', url: audioUploadResult,
-                duration: originalAudioDuration, uploadedBy: user, thumbnail: '',
-            });
-            const savedMusic = await newMusic.save();
-            finalMusicId = savedMusic._id;
+            if (hasAudio) {
+                console.log("🔉 Original audio stream found. Extracting...");
+                const extractedAudioTmp = tmp.fileSync({ postfix: ".mp3" });
+                tempFiles.push(extractedAudioTmp);
+                await new Promise((resolve, reject) => {
+                    ffmpeg(outputTmp.name).outputOptions(["-vn", "-c:a libmp3lame", "-b:a 128k", "-y"])
+                        .save(extractedAudioTmp.name)
+                        .on("end", () => { console.log("✅ Original audio extracted."); resolve(); })
+                        .on("error", (err) => { console.error("❌ Audio extraction error:", err); reject(err); });
+                });
+                
+                console.log("📤 Uploading extracted original audio to S3...");
+                const audioBuffer = fs.readFileSync(extractedAudioTmp.name);
+                const audioUploadResult = await uploadToS3(
+                    { buffer: audioBuffer, originalname: `original-sound-${userid}-${Date.now()}.mp3`, mimetype: "audio/mp3" }, `audio`
+                );
+                
+                let originalAudioDuration = 0;
+                const videoDurationMs = (parseFloat(videoEndTime) - parseFloat(videoStartTime));
+                if (!isNaN(videoDurationMs) && videoDurationMs > 0) originalAudioDuration = Math.round(videoDurationMs / 1000);
+
+                console.log("💾 Saving original audio as new Music doc...");
+                const newMusic = new Music({
+                    title: caption ? `${caption.substring(0, 50)}... (Original Sound)` : "Original Video Sound",
+                    artist: name || username || 'Unknown User', url: audioUploadResult,
+                    duration: originalAudioDuration, uploadedBy: user, thumbnail: '',
+                });
+                const savedMusic = await newMusic.save();
+                finalMusicId = savedMusic._id;
+                console.log(`✅ Original audio saved. ID: ${finalMusicId}`);
+            } else {
+                console.log("🔇 No audio stream found in the uploaded video. Skipping audio extraction.");
+                finalMusicId = null; // Silent video hai toh music null set kardo
+            }
         }
 
+        console.log("👤 Updating user/reel metadata in DB...");
         const uploaderUser = await User.findById(user);
         if (savedReel) {
             savedReel.music = finalMusicId; savedReel.caption = caption ?? savedReel.caption;
             savedReel.username = username || savedReel.username; savedReel.name = name || savedReel.name;
             await savedReel.save();
+            console.log("✅ Reel stub updated with final metadata.");
         } 
 
         try {
             if (uploaderUser && savedReel.shortLinks.length === 0) {
+                console.log("🔗 Generating short link for Reel...");
                 const { slug, shortLink } = generateShortLink(savedReel._id, uploaderUser.userid);
                 savedReel.shortLinks.push({ slug, shortLink, generatedForUser: uploaderUser._id, generatedAt: new Date() });
                 await savedReel.save();
+                console.log(`✅ Short link generated: ${shortLink}`);
             }
         } catch (shortLinkError) {
-            console.warn("[WARNING] Failed to generate short link:", shortLinkError.message);
+            console.warn("⚠️ [WARNING] Failed to generate short link:", shortLinkError.message);
         }
 
-        console.log("[STEP 5] Generating HLS segments (Priority 1: 480p for Instant Live)...");
+        console.log("[STEP 5] ⚙️ Generating HLS segments (Priority 1: 480p for Instant Live)...");
         hlsDir = path.join(os.tmpdir(), `hls-${newReelId}`);
         fs.mkdirSync(hlsDir, { recursive: true });
 
         const generateAndUploadVariant = async (variant) => {
+            console.log(`🎬 Generating HLS variant: ${variant.name} (${variant.resolution})...`);
             const variantDir = path.join(hlsDir, variant.name);
             fs.mkdirSync(variantDir, { recursive: true });
             const segmentPattern = path.join(variantDir, "segment_%03d.ts").replace(/\\/g, '/');
@@ -329,9 +417,13 @@ async function processReelUpload(jobData) {
                         "-hls_time", `${variant.hlsTime}`, "-hls_playlist_type", "vod", "-hls_list_size", "0", "-hls_flags", "independent_segments", "-hls_segment_type", "mpegts",
                         `-hls_segment_filename`, segmentPattern, "-f", "hls", "-y",
                     ])
-                    .output(outputPath).on("end", resolve).on("error", reject).run();
+                    .output(outputPath)
+                    .on("end", () => { console.log(`✅ HLS variant ${variant.name} generation complete.`); resolve(); })
+                    .on("error", (err) => { console.error(`❌ HLS variant ${variant.name} error:`, err); reject(err); })
+                    .run();
             });
 
+            console.log(`📤 Uploading ${variant.name} HLS segments to S3...`);
             const files = fs.readdirSync(variantDir).filter(f => fs.statSync(path.join(variantDir, f)).isFile());
             const uploadPromises = files.map(file => {
                 const filePath = path.join(variantDir, file);
@@ -340,28 +432,44 @@ async function processReelUpload(jobData) {
                 const mimetype = file.endsWith(".m3u8") ? "application/vnd.apple.mpegurl" : file.endsWith(".ts") ? "video/mp2t" : "application/octet-stream";
                 return uploadToS3({ buffer, originalname: file, mimetype }, s3Folder, true);
             });
-            while (uploadPromises.length > 0) { await Promise.all(uploadPromises.splice(0, 4)); }
+            while (uploadPromises.length > 0) { 
+                await Promise.all(uploadPromises.splice(0, 4)); 
+            }
+            console.log(`✅ Upload complete for ${variant.name}`);
         };
 
         await generateAndUploadVariant({ name: "480p", resolution: "854x480", videoBitrate: "1100k", audioBitrate: "128k", bandwidth: 1400000, hlsTime: 2 });
 
+        console.log("📝 Generating Master Playlist (m3u8)...");
         const masterPlaylistContent = `#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-STREAM-INF:BANDWIDTH=380000,RESOLUTION=426x240\n240p/index.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=1400000,RESOLUTION=854x480\n480p/index.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720\n720p/index.m3u8\n`;
         fs.writeFileSync(path.join(hlsDir, "master.m3u8"), masterPlaylistContent);
+        console.log("📤 Uploading Master Playlist to S3...");
         await uploadToS3({ buffer: fs.readFileSync(path.join(hlsDir, "master.m3u8")), originalname: "master.m3u8", mimetype: "application/vnd.apple.mpegurl" }, `videos/reels/${newReelId}`, true);
 
         // THUMBNAIL LOGIC
+        console.log("🖼️ Processing Thumbnail...");
         let thumbnailUrl = rawThumbnailUrl; 
         if (!thumbnailUrl) {
+            console.log("📸 Generating thumbnail from video frame...");
             const thumbTmp = tmp.fileSync({ postfix: ".jpg" });
             tempFiles.push(thumbTmp);
             await new Promise((resolve, reject) => {
-                ffmpeg(videoFileWithFinalAudioPath).screenshots({ timestamps: [0], filename: path.basename(thumbTmp.name), folder: path.dirname(thumbTmp.name), size: "640x?" }).on("end", resolve).on("error", reject);
+                ffmpeg(videoFileWithFinalAudioPath).screenshots({ timestamps: [0], filename: path.basename(thumbTmp.name), folder: path.dirname(thumbTmp.name), size: "640x?" })
+                .on("end", () => { console.log("✅ Thumbnail frame captured."); resolve(); })
+                .on("error", (err) => { console.error("❌ Thumbnail capture error:", err); reject(err); });
             });
+            console.log("📤 Uploading generated thumbnail to S3...");
             thumbnailUrl = await uploadToS3({ buffer: fs.readFileSync(thumbTmp.name), originalname: `thumb-${newReelId}.jpg`, mimetype: "image/jpeg" }, "thumbnails");
+        } else {
+            console.log("✅ Using provided rawThumbnailUrl");
         }
 
-        if (!musicId && finalMusicId) await Music.findByIdAndUpdate(finalMusicId, { thumbnail: thumbnailUrl });
+        if (!musicId && finalMusicId) {
+            console.log(`💾 Updating music document with thumbnail...`);
+            await Music.findByIdAndUpdate(finalMusicId, { thumbnail: thumbnailUrl });
+        }
 
+        console.log("💾 Updating Reel DB document to 'Published'...");
         const videoUrl = `https://${process.env.CLOUDFRONT_URL}/videos/reels/${newReelId}/master.m3u8`;
         savedReel.videoUrl = sanitizeCdnUrl(videoUrl);
         savedReel.thumbnailUrl = sanitizeCdnUrl(thumbnailUrl);
@@ -370,14 +478,18 @@ async function processReelUpload(jobData) {
         await savedReel.save();
         console.log("===== 🟢 [PRIORITY DONE: REEL IS PUBLISHED & LIVE!] =====");
 
+        console.log("⚙️ Starting background generation of remaining qualities (240p, 720p)...");
         const remainingVariants = [
             { name: "240p", resolution: "426x240", videoBitrate: "350k", audioBitrate: "64k", bandwidth: 450000, hlsTime: 2 },
             { name: "720p", resolution: "1280x720", videoBitrate: "2000k", audioBitrate: "160k", bandwidth: 2500000, hlsTime: 2 }
         ];
-        for (const variant of remainingVariants) await generateAndUploadVariant(variant);
+        for (const variant of remainingVariants) {
+            await generateAndUploadVariant(variant);
+        }
 
+        console.log("💾 Updating Reel DB document with all quality variants...");
         await Reel.findByIdAndUpdate(newReelId, { $addToSet: { qualityVariants: { $each: ["240p", "720p"] } } });
-        console.log("===== [WORKER: FULL UPLOAD SUCCESS - ALL QUALITIES READY] =====");
+        console.log("===== 🎉 [WORKER: FULL UPLOAD SUCCESS - ALL QUALITIES READY] =====");
 
         // ========================================================
         // 🗑️ STORAGE OPTIMIZATION: Delete Raw MP4 from S3 after processing
@@ -399,22 +511,40 @@ async function processReelUpload(jobData) {
         }
 
     } catch (err) {
-        console.error("===== [WORKER: FULL UPLOAD ERROR] =====", err);
-        if (newReelId) await Reel.findByIdAndUpdate(newReelId, { status: 'failed', error: err.message });
+        console.error("\n===== ❌ [WORKER: FULL UPLOAD FATAL ERROR] =====");
+        console.error(err.stack || err.message || err);
+        if (newReelId) {
+            console.log(`⚠️ Updating Reel ${newReelId} status to 'failed' in DB...`);
+            await Reel.findByIdAndUpdate(newReelId, { status: 'failed', error: err.message });
+        }
         throw err;
     } finally {
-        tempFiles.forEach((t) => { try { if (t) t.removeCallback(); } catch (e) {} });
-        if (hlsDir) { try { fs.rmSync(hlsDir, { recursive: true, force: true }); } catch (e) {} }
+        console.log("🧹 Running local cleanup for temp files...");
+        tempFiles.forEach((t) => { 
+            try { if (t) t.removeCallback(); } catch (e) { console.error("Temp file delete err:", e); } 
+        });
+        if (hlsDir) { 
+            try { fs.rmSync(hlsDir, { recursive: true, force: true }); } catch (e) { console.error("HLS dir delete err:", e); } 
+        }
+        console.log("✅ Cleanup done. Worker ready for next job.\n======================================================\n");
     }
 }
 
 // Start BullMQ Worker
 const redisConnection = new IORedis({ maxRetriesPerRequest: null }); 
-const worker = new Worker('reel-processing', async job => {
-    await processReelUpload(job.data);
-}, { connection: redisConnection, concurrency: 5 }); // concurrency 5 means it processes 5 videos simultaneously
 
-worker.on('completed', job => { console.log(`Job ${job.id} has completed!`); });
-worker.on('failed', (job, err) => { console.error(`Job ${job.id} has failed with ${err.message}`); });
+redisConnection.on('connect', () => console.log("✅ Worker connected to Redis"));
+redisConnection.on('error', (err) => console.error("❌ Redis connection error:", err));
+
+const worker = new Worker('reel-processing', async job => {
+    console.log(`\n🔔 Worker picked up job ID: ${job.id}`);
+    await processReelUpload(job.data);
+}, { connection: redisConnection, concurrency: 4 }); // concurrency 4 means it processes 4 videos simultaneously
+
+worker.on('active', job => { console.log(`▶️ Job ${job.id} is now ACTIVE.`); });
+worker.on('completed', job => { console.log(`🏁 Job ${job.id} has COMPLETED successfully!`); });
+worker.on('failed', (job, err) => { console.error(`❌ Job ${job.id} has FAILED with error: ${err.message}`); });
+worker.on('error', err => { console.error(`⚠️ Worker caught an error:`, err); });
+worker.on('stalled', (jobId) => { console.warn(`⚠️ Job ${jobId} has stalled!`); });
 
 console.log("🚀 Background Worker is running and waiting for jobs...");

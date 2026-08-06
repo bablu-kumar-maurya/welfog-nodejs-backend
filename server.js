@@ -1,5 +1,17 @@
 const express = require("express");
 const app = express();
+const http = require("http");
+const server = http.createServer(app);
+const { Server } = require("socket.io");
+const io = new Server(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST", "PUT", "DELETE"],
+  },
+});
+
+const { initChatSockets } = require("./sockets/chatSocket");
+initChatSockets(io);
 require("dotenv").config();
 require("./config/firebase");
 const mongoose = require("mongoose");
@@ -238,6 +250,7 @@ const shareRoutes = require("./routes/shareRoutes");
 const suspendRoutes = require("./routes/suspendRoutes");
 const uploadRoute = require("./routes/uploadRoute");
 const userblockRoute = require("./routes/userblockRoute");
+const chatRoutes = require("./routes/chatRoutes");
 
 console.log("🛤️ Mounting Routes...");
 app.use("/api/users", userRoutes);
@@ -251,6 +264,7 @@ app.use("/api/plays", shareRoutes);
 app.use("/api/suspend", suspendRoutes);
 app.use("/api/uploads", uploadRoute);
 app.use("/api/userblocks", userblockRoute);
+app.use("/api/chat", chatRoutes);
 console.log("✅ All routes mounted.");
 
 app.get("/", (req, res) => {
@@ -260,6 +274,6 @@ app.get("/", (req, res) => {
   });
 });
 
-app.listen(PORT, () => {
-  console.log(`🚀 Server is running on port ${PORT}`);
+server.listen(PORT, () => {
+  console.log(`🚀 Server is running on port ${PORT} with Socket.IO enabled`);
 });

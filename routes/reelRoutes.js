@@ -53,7 +53,7 @@ router.post("/generate-upload-url", async (req, res) => {
     console.log("\n=======================================================");
     console.log("📡 [POST /generate-upload-url] API Hit!");
     console.log("📦 Request Body:", req.body);
-    
+
     try {
         const { filename, fileType, isThumbnail } = req.body;
         if (!filename || !fileType) {
@@ -96,7 +96,7 @@ router.post("/full-upload", async (req, res) => {
     console.log("\n=======================================================");
     console.log("📡 [POST /full-upload] API Hit!");
     console.log("📋 HEADERS =", req.headers["content-type"]);
-    
+
     try {
         // Ab frontend multer (FormData) ki jagah JSON bheja karega S3 URLs ke sath
         const {
@@ -367,7 +367,7 @@ router.post("/upload", async (req, res) => {
         } catch (logError) {
             console.error("⚠️ Log error (non-blocking):", logError.message);
         }
-        
+
         console.log("✅ Sending final success response.");
         res.status(201).json({
             message: "Reels Saved Successfully",
@@ -404,17 +404,25 @@ router.get("/by-music/:id", async (req, res) => {
         };
 
         // 🔥 ADDED: MUTUAL BLOCK FILTER LOGIC START 🔥
-        if (currentUserId && mongoose.isValidObjectId(currentUserId)) {
-            const viewer = await User.findById(currentUserId).select("blockedUsers").lean();
-            const blockedList = viewer?.blockedUsers || [];
+        if (currentUserId) {
+            let viewer = null;
+            if (mongoose.isValidObjectId(currentUserId)) {
+                viewer = await User.findById(currentUserId).select("blockedUsers").lean();
+            }
+            if (!viewer) {
+                viewer = await User.findOne({ userid: currentUserId }).select("blockedUsers").lean();
+            }
 
-            const blockers = await User.find({ blockedUsers: currentUserId }).select("_id").lean();
-            const usersWhoBlockedMe = blockers.map(b => b._id);
+            if (viewer) {
+                const blockedList = viewer.blockedUsers || [];
+                const blockers = await User.find({ blockedUsers: viewer._id }).select("_id").lean();
+                const usersWhoBlockedMe = blockers.map(b => b._id);
 
-            const allBlocked = [...blockedList, ...usersWhoBlockedMe];
+                const allBlocked = [...blockedList, ...usersWhoBlockedMe];
 
-            if (allBlocked.length > 0) {
-                query.user = { $nin: allBlocked }; // Blocked logo ki reels music list se hide
+                if (allBlocked.length > 0) {
+                    query.user = { $nin: allBlocked }; // Blocked logo ki reels music list se hide
+                }
             }
         }
         // 🔥 ADDED: MUTUAL BLOCK FILTER LOGIC END 🔥
@@ -630,24 +638,31 @@ router.get("/shownew", async (req, res) => {
         matchStage.isDeleted = { $ne: true };
         matchStage.status = { $ne: "Blocked" };
 
+        let viewer = null;
         if (mongoose.isValidObjectId(currentUserId)) {
-            const viewer = await User.findById(currentUserId).select("blockedUsers isDeleted").lean();
+            viewer = await User.findById(currentUserId).select("blockedUsers isDeleted profilePicture").lean();
+        }
+        if (!viewer) {
+            viewer = await User.findOne({ userid: currentUserId }).select("blockedUsers isDeleted profilePicture").lean();
+        }
 
-            if (viewer && viewer.isDeleted) {
+        if (viewer) {
+            if (viewer.isDeleted) {
                 return res.status(403).json({ message: "Your account is deleted. Access denied." });
             }
 
-            const blockedList = viewer?.blockedUsers || [];
-            const blockers = await User.find({ blockedUsers: currentUserId }).select("_id").lean();
+            const blockedList = viewer.blockedUsers || [];
+            const blockers = await User.find({ blockedUsers: viewer._id }).select("_id").lean();
             const usersWhoBlockedMe = blockers.map(b => b._id);
 
-            const allExcludedUsers = [...blockedList, ...usersWhoBlockedMe];
+            const allExcludedUsers = [...blockedList, ...usersWhoBlockedMe].map(id => new mongoose.Types.ObjectId(id));
+
             if (allExcludedUsers.length > 0) {
                 matchStage.user = { $nin: allExcludedUsers };
             }
 
             const notInterestedInteractions = await ReelInteraction.find({
-                user: currentUserId,
+                user: viewer._id,
                 action: "not_interested"
             })
                 .select("reel")
@@ -679,9 +694,8 @@ router.get("/shownew", async (req, res) => {
         });
 
         // 👤 Fetch current user's profile picture
-        const currentUser = await User.findById(currentUserId, "profilePicture").lean();
-        const currentUserProfilePic = currentUser?.profilePicture || "";
-        const currentUserIdStr = currentUserId.toString();
+        const currentUserProfilePic = viewer?.profilePicture || "";
+        const currentUserIdStr = viewer ? viewer._id.toString() : (currentUserId ? currentUserId.toString() : "");
 
         // 🔁 Map Loop
         const reelsWithFollow = reels.map((reel) => {
@@ -722,14 +736,24 @@ router.post("/view", async (req, res) => {
             return res.status(400).json({ message: "reelId and userId are required" });
         }
 
-        if (!mongoose.isValidObjectId(reelId) || !mongoose.isValidObjectId(userId)) {
-            return res.status(400).json({ message: "Invalid reelId or userId" });
+        if (!mongoose.isValidObjectId(reelId)) {
+            return res.status(400).json({ message: "Invalid reelId" });
         }
 
         // Fetch user with blockedUsers for block check
-        const user = await User.findById(userId).select("isSuspended blockedUsers").lean();
+        let user = null;
+        if (mongoose.isValidObjectId(userId)) {
+            user = await User.findById(userId).select("isSuspended blockedUsers").lean();
+        }
+        if (!user) {
+            user = await User.findOne({ userid: userId }).select("isSuspended blockedUsers").lean();
+        }
 
-        if (user?.isSuspended) {
+        if (!user) {
+            return res.status(404).json({ message: "User not found" });
+        }
+
+        if (user.isSuspended) {
             return res.status(200).json({
                 message: "View ignored"
             });
@@ -744,8 +768,8 @@ router.post("/view", async (req, res) => {
         if (currentReel.user) {
             const owner = await User.findById(currentReel.user).select("blockedUsers").lean();
 
-            const hasOwnerBlockedViewer = owner?.blockedUsers?.some(bid => bid.toString() === userId.toString());
-            const hasViewerBlockedOwner = user?.blockedUsers?.some(bid => bid.toString() === currentReel.user.toString());
+            const hasOwnerBlockedViewer = owner?.blockedUsers?.some(bid => bid.toString() === user._id.toString());
+            const hasViewerBlockedOwner = user.blockedUsers?.some(bid => bid.toString() === currentReel.user.toString());
 
             if (hasOwnerBlockedViewer || hasViewerBlockedOwner) {
                 // View ko silently ignore kar diya taaki frontend player crash na ho
@@ -756,8 +780,8 @@ router.post("/view", async (req, res) => {
 
         // Atomically add user to viewsdata only if not present, and increment views only in that case
         const updated = await Reel.findOneAndUpdate(
-            { _id: reelId, viewsdata: { $ne: userId } },
-            { $addToSet: { viewsdata: userId }, $inc: { views: 1 } },
+            { _id: reelId, viewsdata: { $ne: user._id } },
+            { $addToSet: { viewsdata: user._id }, $inc: { views: 1 } },
             { new: true }
         );
 
@@ -801,29 +825,34 @@ router.get("/current/:id", async (req, res) => {
             return res.status(404).json({ message: "Reel not available" });
         }
 
+        // Resolve viewer to support string userid fallback
+        let viewer = null;
+        if (currentUserId) {
+            if (mongoose.isValidObjectId(currentUserId)) {
+                viewer = await User.findById(currentUserId).select("blockedUsers profilePicture").lean();
+            }
+            if (!viewer) {
+                viewer = await User.findOne({ userid: currentUserId }).select("blockedUsers profilePicture").lean();
+            }
+        }
+
         // 🔥 ADDED: MUTUAL BLOCK CHECK START 🔥
-        if (currentUserId && mongoose.isValidObjectId(currentUserId) && currentReel.user) {
-            const viewer = await User.findById(currentUserId).select("blockedUsers").lean();
+        if (viewer && currentReel.user) {
             const owner = await User.findById(currentReel.user).select("blockedUsers").lean();
 
-            const hasViewerBlockedOwner = viewer?.blockedUsers?.some(bid => bid.toString() === currentReel.user.toString());
-            const hasOwnerBlockedViewer = owner?.blockedUsers?.some(bid => bid.toString() === currentUserId.toString());
+            if (owner) {
+                const hasViewerBlockedOwner = viewer.blockedUsers?.some(bid => bid.toString() === currentReel.user.toString());
+                const hasOwnerBlockedViewer = owner.blockedUsers?.some(bid => bid.toString() === viewer._id.toString());
 
-            if (hasViewerBlockedOwner || hasOwnerBlockedViewer) {
-                return res.status(404).json({ message: "Reel not available" });
+                if (hasViewerBlockedOwner || hasOwnerBlockedViewer) {
+                    return res.status(404).json({ message: "Reel not available" });
+                }
             }
         }
         // 🔥 ADDED: MUTUAL BLOCK CHECK END 🔥
 
         // 4️⃣ Fetch current user's profile picture
-        let currentUserProfilePic = "";
-        if (currentUserId && mongoose.isValidObjectId(currentUserId)) {
-            const currentUser = await User.findById(
-                currentUserId,
-                "profilePicture"
-            ).lean();
-            currentUserProfilePic = currentUser?.profilePicture || "";
-        }
+        const currentUserProfilePic = viewer?.profilePicture || "";
 
         // 5️⃣ Fetch reel owner info
         const reelOwner = await User.findById(
@@ -834,8 +863,9 @@ router.get("/current/:id", async (req, res) => {
         const reelUserProfilePic = reelOwner?.profilePicture || "";
 
         // 6️⃣ Check follow status
+        const currentUserIdStr = viewer ? viewer._id.toString() : (currentUserId ? currentUserId.toString() : "");
         const isFollowing = reelOwner?.followers?.some(
-            (followerId) => followerId.toString() === currentUserId
+            (followerId) => followerId.toString() === currentUserIdStr
         );
 
         // 7️⃣ Final response object
@@ -971,14 +1001,22 @@ router.get("/others/:userId", async (req, res) => {
             query.user = userId;
         }
 
+        // Resolve currentUserId / viewer to handle string userid
+        let viewer = null;
+        if (currentUserId) {
+            if (mongoose.isValidObjectId(currentUserId)) {
+                viewer = await User.findById(currentUserId).select("blockedUsers profilePicture").lean();
+            }
+            if (!viewer) {
+                viewer = await User.findOne({ userid: currentUserId }).select("blockedUsers profilePicture").lean();
+            }
+        }
+
         // 🔥 ADDED: MUTUAL BLOCK FILTER LOGIC START 🔥
-        if (currentUserId && mongoose.isValidObjectId(currentUserId)) {
-            const viewer = await User.findById(currentUserId).select("blockedUsers").lean();
-            const blockedList = viewer?.blockedUsers || [];
-
-            const blockers = await User.find({ blockedUsers: currentUserId }).select("_id").lean();
+        if (viewer) {
+            const blockedList = viewer.blockedUsers || [];
+            const blockers = await User.find({ blockedUsers: viewer._id }).select("_id").lean();
             const usersWhoBlockedMe = blockers.map(b => b._id);
-
             const allBlocked = [...blockedList, ...usersWhoBlockedMe];
 
             if (allBlocked.length > 0) {
@@ -996,9 +1034,9 @@ router.get("/others/:userId", async (req, res) => {
         }
         // 🔥 ADDED: MUTUAL BLOCK FILTER LOGIC END 🔥
 
-        if (currentUserId && mongoose.isValidObjectId(currentUserId)) {
+        if (viewer) {
             const notInterested = await ReelInteraction.find({
-                user: new mongoose.Types.ObjectId(currentUserId),
+                user: viewer._id,
                 action: "not_interested"
             }).select("reel").lean();
 
@@ -1044,14 +1082,8 @@ router.get("/others/:userId", async (req, res) => {
         }
 
         // 👤 Fetch current user's profile picture
-        let currentUserProfilePic = "";
-        if (currentUserId && mongoose.isValidObjectId(currentUserId)) {
-            const currentUser = await User.findById(
-                currentUserId,
-                "profilePicture"
-            ).lean();
-            currentUserProfilePic = currentUser?.profilePicture || "";
-        }
+        const currentUserProfilePic = viewer?.profilePicture || "";
+        const currentUserIdStr = viewer ? viewer._id.toString() : (currentUserId ? currentUserId.toString() : "");
 
         // 🔁 Enhance reels with follow status + profile pics
         const enhancedReels = await Promise.all(
@@ -1065,7 +1097,7 @@ router.get("/others/:userId", async (req, res) => {
 
                 const isFollowing = reelOwner?.followers?.some(
                     (followerId) =>
-                        followerId.toString() === currentUserId
+                        followerId.toString() === currentUserIdStr
                 );
 
                 return {
@@ -1288,7 +1320,13 @@ router.put("/like/:id", async (req, res) => {
         if (!userId) return res.status(400).json({ message: "User ID is required" });
 
         // ✅ Fetch user
-        const user = await User.findById(userId);
+        let user = null;
+        if (mongoose.isValidObjectId(userId)) {
+            user = await User.findById(userId);
+        }
+        if (!user) {
+            user = await User.findOne({ userid: userId });
+        }
         console.log("========== USER ==========");
         console.log("User ObjectId:", user?._id);
         console.log("User UserId:", user?.userid);
@@ -1317,7 +1355,7 @@ router.put("/like/:id", async (req, res) => {
         if (reel.user) {
             const owner = await User.findById(reel.user).select("blockedUsers").lean();
 
-            const hasOwnerBlockedViewer = owner?.blockedUsers?.some(bid => bid.toString() === userId.toString());
+            const hasOwnerBlockedViewer = owner?.blockedUsers?.some(bid => bid.toString() === user._id.toString());
             const hasViewerBlockedOwner = user.blockedUsers?.some(bid => bid.toString() === reel.user.toString());
 
             if (hasOwnerBlockedViewer || hasViewerBlockedOwner) {
@@ -1326,13 +1364,13 @@ router.put("/like/:id", async (req, res) => {
         }
         // 🔥 ADDED: MUTUAL BLOCK CHECK END 🔥
 
-        const alreadyLiked = reel.likes.includes(userId);
+        const alreadyLiked = reel.likes.includes(user._id);
         console.log("========== LIKE STATUS ==========");
         console.log("Already Liked:", alreadyLiked);
         if (alreadyLiked) {
             // ❌ UNLIKE (NO NOTIFICATION)
             console.log("👉 UNLIKE FLOW");
-            reel.likes = reel.likes.filter(id => id.toString() !== userId);
+            reel.likes = reel.likes.filter(id => id.toString() !== user._id.toString());
             await reel.save();
             console.log("Returning Response: Reel unliked");
             return res.status(200).json({
@@ -1342,7 +1380,7 @@ router.put("/like/:id", async (req, res) => {
 
         } else {
             // ❤️ LIKE
-            reel.likes.push(userId);
+            reel.likes.push(user._id);
             await reel.save();
 
             // 🔔 CREATE LIKE NOTIFICATION

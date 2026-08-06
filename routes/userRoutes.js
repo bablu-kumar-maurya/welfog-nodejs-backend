@@ -114,7 +114,7 @@ router.post("/", async (req, res) => {
         existingUser.lastConnectedAt = new Date();
       }
 
-      // 🔥 FIX: login / bootstrap pe frontend wali shop userid save karo
+
       if (incomingUserId) {
         existingUser.userid = incomingUserId;
       }

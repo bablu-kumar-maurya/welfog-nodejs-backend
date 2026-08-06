@@ -19,7 +19,7 @@ const { DeleteObjectCommand } = require("@aws-sdk/client-s3");
 const Reel = require("./models/Reel"); 
 const User = require("./models/Users");
 const Music = require("./models/Music"); 
-const { uploadToS3, s3 } = require("./lib/s3"); // S3 client aur upload function
+const { uploadToS3, s3, deleteFileFromS3 } = require("./lib/s3"); // S3 client aur upload function
 const { generateShortLink } = require("./utils/shortLink");
 
 // DB Connection
@@ -63,6 +63,80 @@ async function compressVideo(inputPath, outputPath) {
           .on("error", (err) => { console.error("❌ [compressVideo] Error:", err); reject(err); });
     });
 }
+
+async function compressImageToWebP(inputPath, outputPath) {
+    console.log(`🖼️ [compressImageToWebP] Started: ${inputPath} -> ${outputPath}`);
+    let qVal = 75; // Initial quality (0 to 100)
+    const minSize = 30 * 1024; // 30 KB
+    const maxSize = 40 * 1024; // 40 KB
+    let bestQ = qVal;
+    let bestSizeDiff = Infinity;
+    
+    for (let attempt = 0; attempt < 5; attempt++) {
+        await new Promise((resolve, reject) => {
+            ffmpeg(inputPath)
+                .outputOptions([
+                    '-c:v', 'libwebp',
+                    '-q:v', String(qVal)
+                ])
+                .output(outputPath)
+                .on('end', resolve)
+                .on('error', (err) => {
+                    console.error("❌ FFmpeg webp compress error:", err);
+                    reject(err);
+                })
+                .run();
+        });
+        
+        const stats = fs.statSync(outputPath);
+        const sizeKB = stats.size / 1024;
+        console.log(`🖼️ [compressImageToWebP] Attempt ${attempt}: Q=${qVal}, Size=${sizeKB.toFixed(2)} KB`);
+        
+        if (stats.size >= minSize && stats.size <= maxSize) {
+            console.log(`✅ [compressImageToWebP] Perfect match found! Q=${qVal}, Size=${sizeKB.toFixed(2)} KB`);
+            return;
+        }
+        
+        if (stats.size < minSize && qVal >= 85) {
+            console.log(`ℹ️ [compressImageToWebP] Size is under 30KB but quality is high (Q=${qVal}). Keeping it to preserve quality.`);
+            return;
+        }
+        
+        // Track the best choice so far
+        const diff = Math.min(Math.abs(stats.size - minSize), Math.abs(stats.size - maxSize));
+        if (diff < bestSizeDiff) {
+            bestSizeDiff = diff;
+            bestQ = qVal;
+        }
+        
+        if (stats.size > maxSize) {
+            qVal -= 10; // reduce quality to make size smaller
+        } else {
+            qVal += 8; // increase quality to make size larger
+        }
+        
+        if (qVal < 10 || qVal > 95) {
+            break;
+        }
+    }
+    
+    // If we didn't find a perfect size within the range, run one last time with the bestQ
+    if (qVal !== bestQ) {
+        console.log(`🖼️ [compressImageToWebP] Finalizing with best Q=${bestQ}`);
+        await new Promise((resolve, reject) => {
+            ffmpeg(inputPath)
+                .outputOptions([
+                    '-c:v', 'libwebp',
+                    '-q:v', String(bestQ)
+                ])
+                .output(outputPath)
+                .on('end', resolve)
+                .on('error', reject)
+                .run();
+        });
+    }
+}
+
 
 function getAudioDuration(filePath) {
     return new Promise((resolve, reject) => {
@@ -113,7 +187,7 @@ async function muxMusicOverVideo({ videoPath, audioPath, outputPath, musicStartS
         } else {
             cmd.complexFilter([`${trimmedMusic}[aout]`]);
         }
-        cmd.outputOptions([ "-map", "0:v:0", "-map", "[aout]", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", "-y" ]);
+        cmd.outputOptions([ "-map", "0:v", "-map", "[aout]", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", "-y" ]);
         cmd.save(outputPath)
            .on("end", () => { console.log("✅ [muxMusicOverVideo] Muxing completed!"); resolve(); })
            .on("error", (err) => { console.error("❌ [muxMusicOverVideo] Error:", err); reject(err); });
@@ -191,6 +265,7 @@ async function processReelUpload(jobData) {
     let newReelId = existingReelId;
     let savedReel = null;
     let hlsDir = null;
+    let videoHasAudio = false;
 
     try {
         if (newReelId) {
@@ -227,8 +302,22 @@ async function processReelUpload(jobData) {
                     ffmpeg(inputTmp.name).seekInput(startSec).duration(dur)
                         .outputOptions(["-c", "copy", "-y"])
                         .save(trimmedTmp.name)
-                        .on("end", () => { console.log("✅ Video trim complete."); resolve(); })
-                        .on("error", (err) => { console.error("❌ Video trim error:", err); reject(err); });
+                        .on("end", () => { console.log("✅ Video trim complete (copied streams)."); resolve(); })
+                        .on("error", (err) => {
+                            console.warn("⚠️ Video trim with copy failed, attempting transcode trim fallback...", err.message);
+                            // Fallback to transcode trim: converts video to libx264, standard 8-bit yuv420p, and audio to aac
+                            ffmpeg(inputTmp.name).seekInput(startSec).duration(dur)
+                                .outputOptions([
+                                    "-c:v", "libx264",
+                                    "-pix_fmt", "yuv420p",
+                                    "-c:a", "aac",
+                                    "-b:a", "128k",
+                                    "-y"
+                                ])
+                                .save(trimmedTmp.name)
+                                .on("end", () => { console.log("✅ Video trim complete (transcoded fallback)."); resolve(); })
+                                .on("error", (err2) => { console.error("❌ Video trim fallback failed:", err2); reject(err2); });
+                        });
                 });
                 videoToCompressPath = trimmedTmp.name;
             }
@@ -323,6 +412,7 @@ async function processReelUpload(jobData) {
                 musicStartSec: musicStartMs / 1000, durationSec: muxDurationSec, musicVolume: musicVol, originalVolume: originalVol,
             });
             videoFileWithFinalAudioPath = replacedTmp.name;
+            videoHasAudio = true;
         } else {
             console.log("🎧 No external audio replace requested. Checking for original audio stream...");
             
@@ -369,9 +459,11 @@ async function processReelUpload(jobData) {
                 const savedMusic = await newMusic.save();
                 finalMusicId = savedMusic._id;
                 console.log(`✅ Original audio saved. ID: ${finalMusicId}`);
+                videoHasAudio = true;
             } else {
                 console.log("🔇 No audio stream found in the uploaded video. Skipping audio extraction.");
                 finalMusicId = null; // Silent video hai toh music null set kardo
+                videoHasAudio = false;
             }
         }
 
@@ -408,15 +500,38 @@ async function processReelUpload(jobData) {
             const outputPath = path.join(variantDir, "index.m3u8").replace(/\\/g, '/');
 
             await new Promise((resolve, reject) => {
-                ffmpeg(videoFileWithFinalAudioPath)
+                const cmd = ffmpeg(videoFileWithFinalAudioPath)
                     .videoFilters(`scale=${variant.resolution}:force_original_aspect_ratio=decrease,pad=ceil(iw/2)*2:ceil(ih/2)*2`)
-                    .videoCodec('libx264').audioCodec('aac')
-                    .addOutputOptions([
-                        "-preset", "veryfast", `-b:v ${variant.videoBitrate}`, `-maxrate ${variant.videoBitrate}`, `-bufsize ${parseInt(variant.videoBitrate) * 2}k`, `-b:a ${variant.audioBitrate}`,
-                        "-sc_threshold", "0", "-g", `${24 * variant.hlsTime}`, "-keyint_min", `${24 * variant.hlsTime}`, "-force_key_frames", `expr:gte(t,n_forced*${variant.hlsTime})`,
-                        "-hls_time", `${variant.hlsTime}`, "-hls_playlist_type", "vod", "-hls_list_size", "0", "-hls_flags", "independent_segments", "-hls_segment_type", "mpegts",
-                        `-hls_segment_filename`, segmentPattern, "-f", "hls", "-y",
-                    ])
+                    .videoCodec('libx264');
+
+                const outputOptions = [
+                    "-pix_fmt", "yuv420p", // downsample 10-bit iPhone HDR to standard 8-bit YUV 4:2:0
+                    "-preset", "veryfast",
+                    `-b:v ${variant.videoBitrate}`,
+                    `-maxrate ${variant.videoBitrate}`,
+                    `-bufsize ${parseInt(variant.videoBitrate) * 2}k`,
+                    "-sc_threshold", "0",
+                    "-g", `${24 * variant.hlsTime}`,
+                    "-keyint_min", `${24 * variant.hlsTime}`,
+                    "-force_key_frames", `expr:gte(t,n_forced*${variant.hlsTime})`,
+                    "-hls_time", `${variant.hlsTime}`,
+                    "-hls_playlist_type", "vod",
+                    "-hls_list_size", "0",
+                    "-hls_flags", "independent_segments",
+                    "-hls_segment_type", "mpegts",
+                    `-hls_segment_filename`, segmentPattern,
+                    "-f", "hls",
+                    "-y",
+                ];
+
+                if (videoHasAudio) {
+                    cmd.audioCodec('aac');
+                    outputOptions.push(`-b:a ${variant.audioBitrate}`);
+                } else {
+                    cmd.noAudio();
+                }
+
+                cmd.addOutputOptions(outputOptions)
                     .output(outputPath)
                     .on("end", () => { console.log(`✅ HLS variant ${variant.name} generation complete.`); resolve(); })
                     .on("error", (err) => { console.error(`❌ HLS variant ${variant.name} error:`, err); reject(err); })
@@ -449,19 +564,71 @@ async function processReelUpload(jobData) {
         // THUMBNAIL LOGIC
         console.log("🖼️ Processing Thumbnail...");
         let thumbnailUrl = rawThumbnailUrl; 
-        if (!thumbnailUrl) {
+        if (thumbnailUrl) {
+            console.log("📸 Downloading and compressing provided rawThumbnailUrl to WebP...");
+            try {
+                // 1. Download original thumbnail
+                const origThumbTmp = await downloadFileToTemp(thumbnailUrl, ".jpg");
+                tempFiles.push(origThumbTmp);
+
+                // 2. Prepare temp file for WebP output
+                const compressedThumbTmp = tmp.fileSync({ postfix: ".webp" });
+                tempFiles.push(compressedThumbTmp);
+
+                // 3. Compress/Convert image to WebP (30-40 KB)
+                await compressImageToWebP(origThumbTmp.name, compressedThumbTmp.name);
+
+                // 4. Upload WebP version to S3
+                const compressedUrl = await uploadToS3({
+                    buffer: fs.readFileSync(compressedThumbTmp.name),
+                    originalname: `thumb-${newReelId}.webp`,
+                    mimetype: "image/webp"
+                }, "thumbnails");
+
+                // 5. Delete original uncompressed thumbnail from S3
+                console.log("🗑️ Deleting original uncompressed thumbnail from S3...");
+                await deleteFileFromS3(thumbnailUrl);
+
+                // 6. Use the new WebP URL
+                thumbnailUrl = compressedUrl;
+            } catch (err) {
+                console.error("❌ Error converting/compressing thumbnail to WebP, falling back to original:", err);
+            }
+        } else {
             console.log("📸 Generating thumbnail from video frame...");
+            let screenshotTime = 2; // Default to 2.0 seconds to skip fade-ins
+            try {
+                const duration = await getMediaDurationSec(videoFileWithFinalAudioPath);
+                if (duration > 0) {
+                    if (duration > 5) {
+                        screenshotTime = Math.min(3, duration / 2); // Capture at 3 seconds or midpoint to skip fade-ins
+                    } else {
+                        screenshotTime = duration / 2; // Midpoint for shorter videos
+                    }
+                }
+            } catch (err) {
+                console.error("⚠️ Failed to check duration for thumbnail capture, defaulting to 2s:", err);
+            }
+
             const thumbTmp = tmp.fileSync({ postfix: ".jpg" });
             tempFiles.push(thumbTmp);
             await new Promise((resolve, reject) => {
-                ffmpeg(videoFileWithFinalAudioPath).screenshots({ timestamps: [0], filename: path.basename(thumbTmp.name), folder: path.dirname(thumbTmp.name), size: "640x?" })
-                .on("end", () => { console.log("✅ Thumbnail frame captured."); resolve(); })
+                ffmpeg(videoFileWithFinalAudioPath).screenshots({ timestamps: [screenshotTime], filename: path.basename(thumbTmp.name), folder: path.dirname(thumbTmp.name) })
+                .on("end", () => { console.log(`✅ Thumbnail frame captured at ${screenshotTime}s.`); resolve(); })
                 .on("error", (err) => { console.error("❌ Thumbnail capture error:", err); reject(err); });
             });
-            console.log("📤 Uploading generated thumbnail to S3...");
-            thumbnailUrl = await uploadToS3({ buffer: fs.readFileSync(thumbTmp.name), originalname: `thumb-${newReelId}.jpg`, mimetype: "image/jpeg" }, "thumbnails");
-        } else {
-            console.log("✅ Using provided rawThumbnailUrl");
+
+            // Convert and compress the generated thumbnail to WebP
+            const compressedThumbTmp = tmp.fileSync({ postfix: ".webp" });
+            tempFiles.push(compressedThumbTmp);
+            await compressImageToWebP(thumbTmp.name, compressedThumbTmp.name);
+
+            console.log("📤 Uploading generated compressed WebP thumbnail to S3...");
+            thumbnailUrl = await uploadToS3({
+                buffer: fs.readFileSync(compressedThumbTmp.name),
+                originalname: `thumb-${newReelId}.webp`,
+                mimetype: "image/webp"
+            }, "thumbnails");
         }
 
         if (!musicId && finalMusicId) {

@@ -9,6 +9,7 @@ const io = new Server(server, {
     methods: ["GET", "POST", "PUT", "DELETE"],
   },
 });
+app.set("io", io);
 
 const { initChatSockets } = require("./sockets/chatSocket");
 initChatSockets(io);

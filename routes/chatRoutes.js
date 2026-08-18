@@ -7,20 +7,40 @@ const Message = require("../models/Message");
 const User = require("../models/Users");
 const { uploadToS3, generatePresignedUrl } = require("../lib/s3");
 const { isUserOnline } = require("../sockets/chatSocket");
+const { compressImage, compressVideo, generateVideoThumbnail } = require("../lib/mediaProcessor");
 
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 100 * 1024 * 1024 }, // 100MB limit
 });
 
-// Helper to helper-resolve user (either _id ObjectId or userid string)
+// Helper to helper-resolve user (either _id ObjectId, userid string, mobile, or username)
 async function resolveUserDoc(idOrUserId) {
   if (!idOrUserId) return null;
-  if (mongoose.isValidObjectId(idOrUserId)) {
-    const user = await User.findById(idOrUserId).select("_id username name profilePicture isConnected userid").lean();
+  const str = idOrUserId.toString().trim();
+  if (!str) return null;
+
+  // 1. Try finding by custom string `userid` first
+  let user = await User.findOne({ userid: str })
+    .select("_id username name profilePicture isConnected userid mobile blockedUsers")
+    .lean();
+
+  if (user) return user;
+
+  // 2. If not found by userid and valid ObjectId, check by _id
+  if (mongoose.isValidObjectId(str)) {
+    user = await User.findById(str)
+      .select("_id username name profilePicture isConnected userid mobile blockedUsers")
+      .lean();
     if (user) return user;
   }
-  return await User.findOne({ userid: idOrUserId }).select("_id username name profilePicture isConnected userid").lean();
+
+  // 3. Fallback check by mobile or username
+  user = await User.findOne({ $or: [{ mobile: str }, { username: str }] })
+    .select("_id username name profilePicture isConnected userid mobile blockedUsers")
+    .lean();
+
+  return user;
 }
 
 // =========================================================
@@ -163,6 +183,30 @@ router.post("/conversations/group", async (req, res) => {
   }
 });
 
+async function resolveConversationLastMessage(conv, userId) {
+  if (!conv || !userId) return conv;
+  const user = await resolveUserDoc(userId);
+  if (!user) return conv;
+
+  if (conv.lastMessage && conv.lastMessage.deletedFor) {
+    const isDeleted = conv.lastMessage.deletedFor.some(
+      (id) => id.toString() === user._id.toString()
+    );
+    if (isDeleted) {
+      const Message = require("../models/Message");
+      const actualLastMessage = await Message.findOne({
+        conversation: conv._id,
+        deletedFor: { $ne: user._id }
+      })
+      .sort({ createdAt: -1 })
+      .populate("sender", "username name profilePicture userid")
+      .lean();
+      conv.lastMessage = actualLastMessage;
+    }
+  }
+  return conv;
+}
+
 // =========================================================
 // 3️⃣ GET USER CONVERSATIONS LIST
 // =========================================================
@@ -184,7 +228,7 @@ router.get("/conversations", async (req, res) => {
       isDeleted: { $ne: true },
       deletedFor: { $ne: user._id },
     })
-      .sort({ lastMessageAt: -1, updatedAt: -1 })
+      .sort({ lastMessageAt: -1, createdAt: -1 })
       .populate("participants", "username name profilePicture isConnected userid")
       .populate("groupAdmin", "username name profilePicture userid")
       .populate({
@@ -193,7 +237,7 @@ router.get("/conversations", async (req, res) => {
       })
       .lean();
 
-    const formatted = conversations.map((conv) => {
+    const formatted = await Promise.all(conversations.map(async (conv) => {
       const unread = conv.unreadCounts ? conv.unreadCounts[user._id.toString()] || 0 : 0;
 
       let isOtherOnline = false;
@@ -204,12 +248,14 @@ router.get("/conversations", async (req, res) => {
         }
       }
 
+      const resolvedConv = await resolveConversationLastMessage(conv, user._id);
+
       return {
-        ...conv,
+        ...resolvedConv,
         unreadCount: unread,
         isOtherOnline,
       };
-    });
+    }));
 
     res.status(200).json({
       success: true,
@@ -247,17 +293,19 @@ router.get("/conversations/:conversationId", async (req, res) => {
       return res.status(404).json({ success: false, message: "Conversation not found" });
     }
 
+    let resolvedConversation = conversation;
     if (userId) {
       const user = await resolveUserDoc(userId);
       if (user) {
         const unread = conversation.unreadCounts ? conversation.unreadCounts[user._id.toString()] || 0 : 0;
         conversation.unreadCount = unread;
+        resolvedConversation = await resolveConversationLastMessage(conversation, user._id);
       }
     }
 
     res.status(200).json({
       success: true,
-      conversation,
+      conversation: resolvedConversation,
     });
   } catch (error) {
     console.error("Error fetching conversation details:", error);
@@ -283,7 +331,6 @@ router.get("/conversations/:conversationId/messages", async (req, res) => {
 
     const query = {
       conversation: conversationId,
-      isDeleted: { $ne: true },
     };
 
     if (userId) {
@@ -342,10 +389,14 @@ router.post("/conversations/:conversationId/messages", async (req, res) => {
       type = "text",
       text = "",
       mediaUrl = "",
+      thumbnailUrl = "",
       fileName = "",
       fileSize = 0,
       mimeType = "",
       replyTo = null,
+      sharedReel = null,
+      sharedProduct = null,
+      tempId = null,
     } = req.body;
 
     if (!mongoose.isValidObjectId(conversationId)) {
@@ -366,12 +417,39 @@ router.post("/conversations/:conversationId/messages", async (req, res) => {
       return res.status(404).json({ success: false, message: "Conversation not found" });
     }
 
+    // Bidirectional Block Check for 1-to-1 chats
+    let isReceiverBlocked = false;
+    let otherUserId = null;
+    if (!conversation.isGroup && conversation.participants.length === 2) {
+      otherUserId = conversation.participants.find(
+        (p) => p.toString() !== senderDoc._id.toString()
+      );
+      if (otherUserId) {
+        const otherDoc = await User.findById(otherUserId).select("blockedUsers").lean();
+        const senderBlockedOther = senderDoc.blockedUsers?.some(
+          (id) => id.toString() === otherDoc?._id?.toString()
+        );
+        const otherBlockedSender = otherDoc?.blockedUsers?.some(
+          (id) => id.toString() === senderDoc._id.toString()
+        );
+
+        if (senderBlockedOther) {
+          return res.status(403).json({ success: false, message: "Messaging is blocked between these users" });
+        }
+        if (otherBlockedSender) {
+          isReceiverBlocked = true;
+        }
+      }
+    }
+
     // Determine initial online delivered list
     const deliveredTo = [];
     conversation.participants.forEach((partId) => {
       const partStr = partId.toString();
       if (partStr !== senderDoc._id.toString() && isUserOnline(partStr)) {
-        deliveredTo.push(partId);
+        if (!isReceiverBlocked) {
+          deliveredTo.push(partId);
+        }
       }
     });
 
@@ -383,20 +461,28 @@ router.post("/conversations/:conversationId/messages", async (req, res) => {
       type,
       text,
       mediaUrl,
+      thumbnailUrl,
       fileName,
       fileSize,
       mimeType,
       replyTo: replyTo && mongoose.isValidObjectId(replyTo) ? replyTo : null,
+      sharedReel: sharedReel || null,
+      sharedProduct: sharedProduct || null,
       status: initialStatus,
       deliveredTo,
       seenBy: [],
+      deletedFor: isReceiverBlocked ? [otherUserId] : [],
     });
 
     await newMessage.save();
 
     await newMessage.populate("sender", "username name profilePicture userid");
     if (newMessage.replyTo) {
-      await newMessage.populate("replyTo", "text type sender mediaUrl");
+      await newMessage.populate({
+        path: "replyTo",
+        select: "text type sender mediaUrl fileName",
+        populate: { path: "sender", select: "username name profilePicture userid" }
+      });
     }
 
     // Update conversation's last message
@@ -409,17 +495,46 @@ router.post("/conversations/:conversationId/messages", async (req, res) => {
     conversation.participants.forEach((partId) => {
       const partStr = partId.toString();
       if (partStr !== senderDoc._id.toString()) {
-        const currentCount = conversation.unreadCounts.get(partStr) || 0;
-        conversation.unreadCounts.set(partStr, currentCount + 1);
+        if (!isReceiverBlocked) {
+          const currentCount = conversation.unreadCounts.get(partStr) || 0;
+          conversation.unreadCounts.set(partStr, currentCount + 1);
+        }
       }
     });
 
     await conversation.save();
 
+    const messageData = newMessage.toObject();
+    if (tempId) messageData.tempId = tempId;
+
+    const io = req.app.get("io");
+    if (io) {
+      // Broadcast to conversation room or only to the sender if blocked
+      if (isReceiverBlocked) {
+        io.to(`user:${senderDoc._id.toString()}`).emit("new_message", messageData);
+      } else {
+        io.to(`conv:${conversationId}`).emit("new_message", messageData);
+      }
+
+      // Broadcast to participants' personal user rooms (multi-device)
+      conversation.participants.forEach((partId) => {
+        const pStr = partId.toString();
+        if (pStr === senderDoc._id.toString() || !isReceiverBlocked) {
+          io.to(`user:${pStr}`).emit("conversation_updated", {
+            conversationId,
+            lastMessage: messageData,
+            updatedAt: conversation.lastMessageAt,
+            unreadCount: conversation.unreadCounts ? (conversation.unreadCounts.get(pStr) || 0) : 0,
+          });
+          io.to(`user:${pStr}`).emit("new_message_notification", messageData);
+        }
+      });
+    }
+
     res.status(201).json({
       success: true,
       message: "Message sent successfully",
-      data: newMessage,
+      data: messageData,
     });
   } catch (error) {
     console.error("Error sending message:", error);
@@ -437,15 +552,53 @@ router.post("/upload", upload.single("file"), async (req, res) => {
     }
 
     const folder = req.body.folder || "chat_media";
-    const uploadedFileUrl = await uploadToS3(req.file, folder);
+    let fileBuffer = req.file.buffer;
+    let uploadedThumbnailUrl = "";
+    let mimeType = req.file.mimetype;
+
+    // Fallback: If mimetype is application/octet-stream, guess from file extension
+    if ((mimeType === "application/octet-stream" || !mimeType) && req.file.originalname) {
+      const nameLower = req.file.originalname.toLowerCase();
+      if (nameLower.endsWith(".mp4") || nameLower.endsWith(".mov") || nameLower.endsWith(".avi") || nameLower.endsWith(".mkv") || nameLower.endsWith(".webm") || nameLower.endsWith(".3gp")) {
+        mimeType = "video/mp4";
+      } else if (nameLower.endsWith(".jpg") || nameLower.endsWith(".jpeg") || nameLower.endsWith(".png") || nameLower.endsWith(".webp") || nameLower.endsWith(".gif")) {
+        mimeType = "image/jpeg";
+      }
+    }
+
+    if (mimeType.startsWith("video/")) {
+      console.log("🎥 Generating video thumbnail on backend...");
+      try {
+        const thumbnailBuffer = await generateVideoThumbnail(req.file.buffer);
+        
+        // Upload thumbnail
+        const thumbFile = {
+          originalname: `thumb-${req.file.originalname}.jpg`,
+          mimetype: "image/jpeg",
+          buffer: thumbnailBuffer
+        };
+        uploadedThumbnailUrl = await uploadToS3(thumbFile, folder);
+      } catch (err) {
+        console.warn("Video thumbnail generation failed:", err.message);
+      }
+    }
+
+    const processedFile = {
+      originalname: req.file.originalname,
+      mimetype: mimeType,
+      buffer: fileBuffer
+    };
+
+    const uploadedFileUrl = await uploadToS3(processedFile, folder);
 
     res.status(200).json({
       success: true,
       message: "File uploaded successfully to S3",
       fileUrl: uploadedFileUrl,
+      thumbnailUrl: uploadedThumbnailUrl || null,
       fileName: req.file.originalname,
-      fileSize: req.file.size,
-      mimeType: req.file.mimetype,
+      fileSize: fileBuffer.length,
+      mimeType: mimeType,
     });
   } catch (error) {
     console.error("Error uploading chat file:", error);
@@ -553,7 +706,18 @@ router.delete("/messages/:messageId", async (req, res) => {
       message.isDeleted = true;
       message.text = "This message was deleted.";
       message.mediaUrl = "";
+      message.thumbnailUrl = "";
       await message.save();
+
+      // Emit real-time update to Socket.IO conversation room
+      const io = req.app.get("io");
+      if (io) {
+        io.to(`conv:${message.conversation}`).emit("message_deleted", {
+          messageId: message._id,
+          conversationId: message.conversation,
+          deletedForEveryone: true
+        });
+      }
 
       return res.status(200).json({
         success: true,
@@ -609,6 +773,9 @@ router.put("/conversations/:conversationId/read", async (req, res) => {
     const conversation = await Conversation.findById(conversationId);
     if (conversation) {
       conversation.unreadCounts.set(user._id.toString(), 0);
+      if (user.userid) {
+        conversation.unreadCounts.set(user.userid.toString(), 0);
+      }
       await conversation.save();
     }
 
@@ -719,8 +886,16 @@ router.put("/conversations/:conversationId/group-info", async (req, res) => {
       return res.status(403).json({ success: false, message: "Only group members can update group info" });
     }
 
+    if (groupAvatar !== undefined) {
+      const isAdmin = (conversation.groupAdmin && conversation.groupAdmin.toString() === requester._id.toString()) || 
+                      (conversation.participants.length > 0 && conversation.participants[0].toString() === requester._id.toString());
+      if (!isAdmin) {
+        return res.status(403).json({ success: false, message: "Only the group admin can update the group profile picture" });
+      }
+      conversation.groupAvatar = groupAvatar;
+    }
+
     if (groupName !== undefined) conversation.groupName = groupName;
-    if (groupAvatar !== undefined) conversation.groupAvatar = groupAvatar;
     if (groupDescription !== undefined) conversation.groupDescription = groupDescription;
 
     await conversation.save();
@@ -734,6 +909,224 @@ router.put("/conversations/:conversationId/group-info", async (req, res) => {
   } catch (error) {
     console.error("Error updating group info:", error);
     res.status(500).json({ success: false, message: "Failed to update group info" });
+  }
+});
+
+// =========================================================
+// 9️⃣ GROUP INVITE LINK ROUTES
+// =========================================================
+
+// Generate or get S3/Group invite link
+router.post("/conversations/:conversationId/invite-link", async (req, res) => {
+  try {
+    const { conversationId } = req.params;
+    const { adminId } = req.body;
+    console.log(`✉️ [InviteLink] Req conversationId: ${conversationId}, adminId: ${adminId}`);
+
+    const conversation = await Conversation.findById(conversationId);
+    if (!conversation) {
+      console.log(`❌ [InviteLink] Conversation not found: ${conversationId}`);
+      return res.status(404).json({ success: false, message: "Group conversation not found" });
+    }
+    if (!conversation.isGroup) {
+      console.log(`❌ [InviteLink] Conversation is not a group: ${conversationId}`);
+      return res.status(404).json({ success: false, message: "Group conversation not found" });
+    }
+
+    const admin = await resolveUserDoc(adminId);
+    if (!admin) {
+      console.log(`❌ [InviteLink] Admin user not resolved for adminId: ${adminId}`);
+      return res.status(403).json({ success: false, message: "Only group admin can manage invite links" });
+    }
+
+    // Auto-repair groupAdmin if not set
+    if (!conversation.groupAdmin && conversation.participants.length > 0) {
+      console.log(`⚠️ [InviteLink] groupAdmin is missing. Setting to first participant: ${conversation.participants[0]}`);
+      conversation.groupAdmin = conversation.participants[0];
+      await conversation.save();
+    }
+
+    console.log(`✉️ [InviteLink] GroupAdmin: ${conversation.groupAdmin}, Admin: ${admin._id}`);
+
+    if (conversation.groupAdmin.toString() !== admin._id.toString()) {
+      console.log(`❌ [InviteLink] Requester ${admin._id} is not the group admin ${conversation.groupAdmin}`);
+      return res.status(403).json({ success: false, message: "Only group admin can manage invite links" });
+    }
+
+    // If inviteCode doesn't exist, generate a new one
+    if (!conversation.inviteCode) {
+      const { v4: uuidv4 } = require("uuid");
+      conversation.inviteCode = uuidv4().replace(/-/g, "").substring(0, 16);
+      await conversation.save();
+      console.log(`✅ [InviteLink] Generated new code: ${conversation.inviteCode}`);
+    } else {
+      console.log(`✅ [InviteLink] Existing code: ${conversation.inviteCode}`);
+    }
+
+    res.status(200).json({
+      success: true,
+      inviteCode: conversation.inviteCode,
+    });
+  } catch (error) {
+    console.error("Error managing invite link:", error);
+    res.status(500).json({ success: false, message: "Failed to manage invite link" });
+  }
+});
+
+// Revoke/Delete invite link
+router.delete("/conversations/:conversationId/invite-link", async (req, res) => {
+  try {
+    const { conversationId } = req.params;
+    const { adminId } = req.body;
+
+    const conversation = await Conversation.findById(conversationId);
+    if (!conversation || !conversation.isGroup) {
+      return res.status(404).json({ success: false, message: "Group conversation not found" });
+    }
+
+    const admin = await resolveUserDoc(adminId);
+    if (!admin || !conversation.groupAdmin || conversation.groupAdmin.toString() !== admin._id.toString()) {
+      return res.status(403).json({ success: false, message: "Only group admin can revoke invite links" });
+    }
+
+    conversation.inviteCode = "";
+    await conversation.save();
+
+    res.status(200).json({
+      success: true,
+      message: "Invite link revoked successfully",
+    });
+  } catch (error) {
+    console.error("Error revoking invite link:", error);
+    res.status(500).json({ success: false, message: "Failed to revoke invite link" });
+  }
+});
+
+// Resolve S3/Group invite code details
+router.get("/groups/invite/:inviteCode", async (req, res) => {
+  try {
+    const { inviteCode } = req.params;
+    const { userId } = req.query;
+
+    if (!inviteCode) {
+      return res.status(400).json({ success: false, message: "Invite code is required" });
+    }
+
+    const conversation = await Conversation.findOne({ inviteCode });
+    if (!conversation || !conversation.isGroup) {
+      return res.status(404).json({ success: false, message: "Invite link is invalid or has been revoked" });
+    }
+
+    let isAlreadyMember = false;
+    if (userId) {
+      const user = await resolveUserDoc(userId);
+      if (user) {
+        isAlreadyMember = conversation.participants.some((id) => id.toString() === user._id.toString());
+      }
+    }
+
+    await conversation.populate("participants", "username name profilePicture isConnected userid");
+
+    res.status(200).json({
+      success: true,
+      groupName: conversation.groupName,
+      groupAvatar: conversation.groupAvatar,
+      memberCount: conversation.participants.length,
+      isAlreadyMember,
+      participants: conversation.participants,
+    });
+  } catch (error) {
+    console.error("Error fetching invite details:", error);
+    res.status(500).json({ success: false, message: "Failed to fetch invite details" });
+  }
+});
+
+// Join group via S3/Group invite code
+router.post("/groups/invite/:inviteCode/join", async (req, res) => {
+  try {
+    const { inviteCode } = req.params;
+    const { userId } = req.body;
+
+    if (!inviteCode) {
+      return res.status(400).json({ success: false, message: "Invite code is required" });
+    }
+
+    const conversation = await Conversation.findOne({ inviteCode });
+    if (!conversation || !conversation.isGroup) {
+      return res.status(404).json({ success: false, message: "Invite link is invalid or has been revoked" });
+    }
+
+    const user = await resolveUserDoc(userId);
+    if (!user) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    const isAlreadyMember = conversation.participants.some((id) => id.toString() === user._id.toString());
+    if (isAlreadyMember) {
+      return res.status(200).json({
+        success: true,
+        message: "Already a member of the group",
+        conversation,
+      });
+    }
+
+    // Add user to participants
+    conversation.participants.push(user._id);
+    conversation.unreadCounts.set(user._id.toString(), 0);
+    await conversation.save();
+
+    await conversation.populate("participants", "username name profilePicture isConnected userid");
+
+    res.status(200).json({
+      success: true,
+      message: "Joined group successfully",
+      conversation,
+    });
+  } catch (error) {
+    console.error("Error joining group:", error);
+    res.status(500).json({ success: false, message: "Failed to join group" });
+  }
+});
+
+// Get bidirectional block status between two users
+router.get("/conversations/block-status/:otherUserId", async (req, res) => {
+  try {
+    const { otherUserId } = req.params;
+    const { currentUserId } = req.query;
+
+    if (!currentUserId || !otherUserId) {
+      return res.status(400).json({ success: false, message: "Missing currentUserId or otherUserId" });
+    }
+
+    const currentUser = await resolveUserDoc(currentUserId);
+    const otherUser = await resolveUserDoc(otherUserId);
+
+    if (!currentUser || !otherUser) {
+      return res.status(200).json({
+        success: true,
+        isThemBlockedByMe: false,
+        isMeBlockedByThem: false,
+        isBlocked: false,
+      });
+    }
+
+    const isThemBlockedByMe = currentUser.blockedUsers?.some(
+      (id) => id.toString() === otherUser._id.toString()
+    ) || false;
+
+    const isMeBlockedByThem = otherUser.blockedUsers?.some(
+      (id) => id.toString() === currentUser._id.toString()
+    ) || false;
+
+    res.status(200).json({
+      success: true,
+      isThemBlockedByMe,
+      isMeBlockedByThem,
+      isBlocked: isThemBlockedByMe || isMeBlockedByThem,
+    });
+  } catch (error) {
+    console.error("Error checking block status:", error);
+    res.status(500).json({ success: false, message: "Failed to check block status" });
   }
 });
 

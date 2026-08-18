@@ -1,6 +1,7 @@
 const Notification = require("../models/Notification");
 const mongoose = require("mongoose");
 const axios = require("axios");
+const User = require("../models/Users");
 
 /**
  * Creates a notification.
@@ -50,6 +51,31 @@ const createNotification = async ({
   }
 
   try {
+    let senderName = "";
+    let senderUsername = "";
+
+    try {
+      let query = {};
+      if (senderObjectId) {
+        query._id = senderObjectId;
+      } else if (senderUserId) {
+        query.userid = senderUserId;
+      }
+
+      if (Object.keys(query).length > 0) {
+        const senderUser = await User.findOne(query).select("name username");
+        if (senderUser) {
+          senderName = senderUser.name || "";
+          senderUsername = senderUser.username || "";
+        }
+      }
+    } catch (userErr) {
+      console.error("⚠️ Failed to fetch sender details for notification:", userErr.message);
+    }
+
+    const displayName = senderName || senderUsername || "Someone";
+    const formattedMessage = `${displayName} ${message}`;
+
     console.log("📝 Saving notification to MongoDB...");
 
     await Notification.create({
@@ -60,7 +86,9 @@ const createNotification = async ({
       type,
       reel,
       comment,
-      message,
+      message: formattedMessage,
+      senderName,
+      senderUsername,
     });
 
     console.log("✅ Notification saved in MongoDB");
@@ -74,7 +102,7 @@ const createNotification = async ({
       data: {
         Type: "play",
         id: notificationId,
-        message,
+        message: formattedMessage,
         recipient: recipientObjectId,
         sender: senderObjectId,
         recipientUserId,
@@ -82,6 +110,8 @@ const createNotification = async ({
         play_type: type,
         reel,
         comment,
+        senderName,
+        senderUsername,
       },
     };
 

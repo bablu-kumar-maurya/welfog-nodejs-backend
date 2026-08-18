@@ -980,6 +980,38 @@ router.get("/others/:userId", async (req, res) => {
             query.qualityVariants = { $in: ["480p", "720p"] };
         }
 
+        let resolvedTargetUserId = null;
+        if (reelType !== "liked" && reelType !== "music") {
+            let cleanUserId = userId || "";
+            if (cleanUserId.startsWith("@")) {
+                cleanUserId = cleanUserId.substring(1);
+            }
+
+            let targetUser = null;
+            if (mongoose.isValidObjectId(cleanUserId)) {
+                targetUser = await User.findById(cleanUserId).lean();
+            }
+            if (!targetUser && mongoose.isValidObjectId(userId)) {
+                targetUser = await User.findById(userId).lean();
+            }
+            if (!targetUser) {
+                targetUser = await User.findOne({ userid: cleanUserId }).lean();
+            }
+            if (!targetUser) {
+                targetUser = await User.findOne({ userid: userId }).lean();
+            }
+            if (!targetUser) {
+                targetUser = await User.findOne({ username: cleanUserId }).lean();
+            }
+            if (!targetUser) {
+                targetUser = await User.findOne({ username: userId }).lean();
+            }
+            if (!targetUser) {
+                return res.status(200).json([]);
+            }
+            resolvedTargetUserId = targetUser._id;
+        }
+
         // 🎯 Decide which reels to fetch
         if (reelType === "liked") {
             if (!currentUserId) {
@@ -998,7 +1030,7 @@ router.get("/others/:userId", async (req, res) => {
             query.music = musicId;
 
         } else {
-            query.user = userId;
+            query.user = resolvedTargetUserId;
         }
 
         // Resolve currentUserId / viewer to handle string userid
@@ -1401,7 +1433,7 @@ router.put("/like/:id", async (req, res) => {
                     senderUserId: user.userid,      // userid string
                     type: "like",
                     reel: reelId,
-                    message: "liked your reel"
+                    message: "liked your video"
                 });
                 console.log("✅ Notification Function Completed");
             } catch (notifError) {

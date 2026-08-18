@@ -66,6 +66,10 @@ const conversationSchema = new mongoose.Schema(
       of: Date,
       default: {},
     },
+    inviteCode: {
+      type: String,
+      default: "",
+    },
   },
   { timestamps: true }
 );

@@ -14,6 +14,8 @@ const ALLOWED_MESSAGE_TYPES = [
   "json",
   "csv",
   "file",
+  "reel",
+  "product",
 ];
 
 const messageSchema = new mongoose.Schema(
@@ -44,6 +46,10 @@ const messageSchema = new mongoose.Schema(
       type: String,
       default: "",
     },
+    thumbnailUrl: {
+      type: String,
+      default: "",
+    },
     fileName: {
       type: String,
       default: "",
@@ -55,6 +61,20 @@ const messageSchema = new mongoose.Schema(
     mimeType: {
       type: String,
       default: "",
+    },
+    sharedReel: {
+      reelId: { type: String, default: "" },
+      videoUrl: { type: String, default: "" },
+      thumbnailUrl: { type: String, default: "" },
+      caption: { type: String, default: "" },
+      authorName: { type: String, default: "" },
+    },
+    sharedProduct: {
+      productId: { type: String, default: "" },
+      title: { type: String, default: "" },
+      imageUrl: { type: String, default: "" },
+      price: { type: Number, default: 0 },
+      slug: { type: String, default: "" },
     },
     status: {
       type: String,

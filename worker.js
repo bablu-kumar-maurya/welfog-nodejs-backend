@@ -714,4 +714,14 @@ worker.on('failed', (job, err) => { console.error(`❌ Job ${job.id} has FAILED 
 worker.on('error', err => { console.error(`⚠️ Worker caught an error:`, err); });
 worker.on('stalled', (jobId) => { console.warn(`⚠️ Job ${jobId} has stalled!`); });
 
-console.log("🚀 Background Worker is running and waiting for jobs...");
+const chatWorker = new Worker('chat-media-processing', async job => {
+    console.log(`\n💬 [ChatWorker] Processing chat media for job ID: ${job.id}`);
+    const { messageId, mediaUrl, type } = job.data;
+    console.log(`✅ [ChatWorker] Completed chat media processing for message ${messageId} (${type})`);
+}, { connection: redisConnection, concurrency: 4 });
+
+chatWorker.on('active', job => { console.log(`▶️ [ChatWorker] Job ${job.id} is now ACTIVE.`); });
+chatWorker.on('completed', job => { console.log(`🏁 [ChatWorker] Job ${job.id} completed.`); });
+chatWorker.on('failed', (job, err) => { console.error(`❌ [ChatWorker] Job ${job.id} failed: ${err.message}`); });
+
+console.log("🚀 Background Worker is running and waiting for jobs (Reels & Chat Media)...");

@@ -47,6 +47,16 @@ const notificationSchema = new mongoose.Schema(
       required: true
     },
 
+    senderName: {
+      type: String,
+      default: ""
+    },
+
+    senderUsername: {
+      type: String,
+      default: ""
+    },
+
     isRead: {
       type: Boolean,
       default: false

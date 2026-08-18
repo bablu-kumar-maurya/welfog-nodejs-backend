@@ -70,7 +70,7 @@ router.post("/conversations/one-to-one", async (req, res) => {
       isGroup: false,
       participants: { $all: [user1._id, user2._id] },
     })
-      .populate("participants", "username name profilePicture isConnected userid")
+      .populate("participants", "username name profilePicture isConnected userid lastConnectedAt")
       .populate({
         path: "lastMessage",
         populate: { path: "sender", select: "username name profilePicture userid" },
@@ -110,7 +110,7 @@ router.post("/conversations/one-to-one", async (req, res) => {
 
     await conversation.save();
 
-    await conversation.populate("participants", "username name profilePicture isConnected userid");
+    await conversation.populate("participants", "username name profilePicture isConnected userid lastConnectedAt");
 
     return res.status(201).json({
       success: true,
@@ -224,12 +224,15 @@ router.get("/conversations", async (req, res) => {
     }
 
     const conversations = await Conversation.find({
-      participants: user._id,
+      $or: [
+        { participants: user._id },
+        { exitedUsers: user._id }
+      ],
       isDeleted: { $ne: true },
       deletedFor: { $ne: user._id },
     })
       .sort({ lastMessageAt: -1, createdAt: -1 })
-      .populate("participants", "username name profilePicture isConnected userid")
+      .populate("participants", "username name profilePicture isConnected userid lastConnectedAt")
       .populate("groupAdmin", "username name profilePicture userid")
       .populate({
         path: "lastMessage",
@@ -280,7 +283,7 @@ router.get("/conversations/:conversationId", async (req, res) => {
     }
 
     const conversation = await Conversation.findById(conversationId)
-      .populate("participants", "username name profilePicture isConnected userid")
+      .populate("participants", "username name profilePicture isConnected userid lastConnectedAt")
       .populate("groupAdmin", "username name profilePicture userid")
       .populate("groupCoAdmins", "username name profilePicture userid")
       .populate({
@@ -803,20 +806,29 @@ router.post("/conversations/:conversationId/participants", async (req, res) => {
     }
 
     const admin = await resolveUserDoc(adminId);
-    if (!admin || conversation.groupAdmin.toString() !== admin._id.toString()) {
+    const isRequesterAdmin = admin && (conversation.groupAdmin.toString() === admin._id.toString() || (conversation.groupCoAdmins && conversation.groupCoAdmins.some((id) => id.toString() === admin._id.toString())));
+    if (!isRequesterAdmin) {
       return res.status(403).json({ success: false, message: "Only group admin can add participants" });
     }
 
     for (const pid of participantIds) {
       const pDoc = await resolveUserDoc(pid);
-      if (pDoc && !conversation.participants.some((id) => id.toString() === pDoc._id.toString())) {
-        conversation.participants.push(pDoc._id);
-        conversation.unreadCounts.set(pDoc._id.toString(), 0);
+      if (pDoc) {
+        if (!conversation.participants.some((id) => id.toString() === pDoc._id.toString())) {
+          conversation.participants.push(pDoc._id);
+          conversation.unreadCounts.set(pDoc._id.toString(), 0);
+        }
+        if (conversation.exitedUsers) {
+          conversation.exitedUsers = conversation.exitedUsers.filter((id) => id.toString() !== pDoc._id.toString());
+        }
+        if (conversation.deletedFor) {
+          conversation.deletedFor = conversation.deletedFor.filter((id) => id.toString() !== pDoc._id.toString());
+        }
       }
     }
 
     await conversation.save();
-    await conversation.populate("participants", "username name profilePicture isConnected userid");
+    await conversation.populate("participants", "username name profilePicture isConnected userid lastConnectedAt");
 
     res.status(200).json({
       success: true,
@@ -847,7 +859,8 @@ router.delete("/conversations/:conversationId/participants/:participantId", asyn
     }
 
     const isSelfRemove = requester._id.toString() === target._id.toString();
-    const isAdmin = conversation.groupAdmin.toString() === requester._id.toString();
+    const isAdmin = conversation.groupAdmin.toString() === requester._id.toString() ||
+                    (conversation.groupCoAdmins && conversation.groupCoAdmins.some((id) => id.toString() === requester._id.toString()));
 
     if (!isSelfRemove && !isAdmin) {
       return res.status(403).json({ success: false, message: "Only admin or member themselves can remove participant" });
@@ -857,8 +870,21 @@ router.delete("/conversations/:conversationId/participants/:participantId", asyn
       (id) => id.toString() !== target._id.toString()
     );
 
+    if (conversation.groupCoAdmins) {
+      conversation.groupCoAdmins = conversation.groupCoAdmins.filter(
+        (id) => id.toString() !== target._id.toString()
+      );
+    }
+
+    if (!conversation.exitedUsers) {
+      conversation.exitedUsers = [];
+    }
+    if (!conversation.exitedUsers.some((id) => id.toString() === target._id.toString())) {
+      conversation.exitedUsers.push(target._id);
+    }
+
     await conversation.save();
-    await conversation.populate("participants", "username name profilePicture isConnected userid");
+    await conversation.populate("participants", "username name profilePicture isConnected userid lastConnectedAt");
 
     res.status(200).json({
       success: true,
@@ -882,16 +908,16 @@ router.put("/conversations/:conversationId/group-info", async (req, res) => {
     }
 
     const requester = await resolveUserDoc(requesterId);
-    if (!requester || !conversation.participants.some((id) => id.toString() === requester._id.toString())) {
-      return res.status(403).json({ success: false, message: "Only group members can update group info" });
+    if (!requester) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+    const isRequesterAdmin = conversation.groupAdmin.toString() === requester._id.toString() ||
+                             (conversation.groupCoAdmins && conversation.groupCoAdmins.some((id) => id.toString() === requester._id.toString()));
+    if (!isRequesterAdmin) {
+      return res.status(403).json({ success: false, message: "Only group admins can update group info" });
     }
 
     if (groupAvatar !== undefined) {
-      const isAdmin = (conversation.groupAdmin && conversation.groupAdmin.toString() === requester._id.toString()) || 
-                      (conversation.participants.length > 0 && conversation.participants[0].toString() === requester._id.toString());
-      if (!isAdmin) {
-        return res.status(403).json({ success: false, message: "Only the group admin can update the group profile picture" });
-      }
       conversation.groupAvatar = groupAvatar;
     }
 
@@ -899,7 +925,7 @@ router.put("/conversations/:conversationId/group-info", async (req, res) => {
     if (groupDescription !== undefined) conversation.groupDescription = groupDescription;
 
     await conversation.save();
-    await conversation.populate("participants", "username name profilePicture isConnected userid");
+    await conversation.populate("participants", "username name profilePicture isConnected userid lastConnectedAt");
 
     res.status(200).json({
       success: true,
@@ -948,8 +974,9 @@ router.post("/conversations/:conversationId/invite-link", async (req, res) => {
 
     console.log(`✉️ [InviteLink] GroupAdmin: ${conversation.groupAdmin}, Admin: ${admin._id}`);
 
-    if (conversation.groupAdmin.toString() !== admin._id.toString()) {
-      console.log(`❌ [InviteLink] Requester ${admin._id} is not the group admin ${conversation.groupAdmin}`);
+    const isRequesterAdmin = admin && (conversation.groupAdmin.toString() === admin._id.toString() || (conversation.groupCoAdmins && conversation.groupCoAdmins.some((id) => id.toString() === admin._id.toString())));
+    if (!isRequesterAdmin) {
+      console.log(`❌ [InviteLink] Requester ${admin._id} is not an admin`);
       return res.status(403).json({ success: false, message: "Only group admin can manage invite links" });
     }
 
@@ -985,7 +1012,8 @@ router.delete("/conversations/:conversationId/invite-link", async (req, res) => 
     }
 
     const admin = await resolveUserDoc(adminId);
-    if (!admin || !conversation.groupAdmin || conversation.groupAdmin.toString() !== admin._id.toString()) {
+    const isRequesterAdmin = admin && (conversation.groupAdmin && (conversation.groupAdmin.toString() === admin._id.toString() || (conversation.groupCoAdmins && conversation.groupCoAdmins.some((id) => id.toString() === admin._id.toString()))));
+    if (!isRequesterAdmin) {
       return res.status(403).json({ success: false, message: "Only group admin can revoke invite links" });
     }
 
@@ -1025,7 +1053,7 @@ router.get("/groups/invite/:inviteCode", async (req, res) => {
       }
     }
 
-    await conversation.populate("participants", "username name profilePicture isConnected userid");
+    await conversation.populate("participants", "username name profilePicture isConnected userid lastConnectedAt");
 
     res.status(200).json({
       success: true,
@@ -1073,9 +1101,17 @@ router.post("/groups/invite/:inviteCode/join", async (req, res) => {
     // Add user to participants
     conversation.participants.push(user._id);
     conversation.unreadCounts.set(user._id.toString(), 0);
+
+    if (conversation.exitedUsers) {
+      conversation.exitedUsers = conversation.exitedUsers.filter((id) => id.toString() !== user._id.toString());
+    }
+    if (conversation.deletedFor) {
+      conversation.deletedFor = conversation.deletedFor.filter((id) => id.toString() !== user._id.toString());
+    }
+
     await conversation.save();
 
-    await conversation.populate("participants", "username name profilePicture isConnected userid");
+    await conversation.populate("participants", "username name profilePicture isConnected userid lastConnectedAt");
 
     res.status(200).json({
       success: true,
@@ -1127,6 +1163,94 @@ router.get("/conversations/block-status/:otherUserId", async (req, res) => {
   } catch (error) {
     console.error("Error checking block status:", error);
     res.status(500).json({ success: false, message: "Failed to check block status" });
+  }
+});
+
+// Promote participant to Co-Admin
+router.post("/conversations/:conversationId/co-admins", async (req, res) => {
+  try {
+    const { conversationId } = req.params;
+    const { requesterId, targetId } = req.body;
+
+    const conversation = await Conversation.findById(conversationId);
+    if (!conversation || !conversation.isGroup) {
+      return res.status(404).json({ success: false, message: "Group conversation not found" });
+    }
+
+    const requester = await resolveUserDoc(requesterId);
+    if (!requester || conversation.groupAdmin.toString() !== requester._id.toString()) {
+      return res.status(403).json({ success: false, message: "Only the primary group admin can assign co-admins" });
+    }
+
+    const target = await resolveUserDoc(targetId);
+    if (!target) {
+      return res.status(404).json({ success: false, message: "Target user not found" });
+    }
+
+    if (!conversation.participants.some(id => id.toString() === target._id.toString())) {
+      return res.status(400).json({ success: false, message: "Target user is not a participant in this group" });
+    }
+
+    if (!conversation.groupCoAdmins) {
+      conversation.groupCoAdmins = [];
+    }
+
+    if (!conversation.groupCoAdmins.some(id => id.toString() === target._id.toString())) {
+      conversation.groupCoAdmins.push(target._id);
+      await conversation.save();
+    }
+
+    await conversation.populate("participants", "username name profilePicture isConnected userid lastConnectedAt");
+    await conversation.populate("groupCoAdmins", "username name profilePicture userid");
+
+    res.status(200).json({
+      success: true,
+      message: "User promoted to co-admin successfully",
+      conversation,
+    });
+  } catch (error) {
+    console.error("Error promoting to co-admin:", error);
+    res.status(500).json({ success: false, message: "Failed to promote user to co-admin" });
+  }
+});
+
+// Demote participant from Co-Admin
+router.delete("/conversations/:conversationId/co-admins/:targetId", async (req, res) => {
+  try {
+    const { conversationId, targetId } = req.params;
+    const { requesterId } = req.body;
+
+    const conversation = await Conversation.findById(conversationId);
+    if (!conversation || !conversation.isGroup) {
+      return res.status(404).json({ success: false, message: "Group conversation not found" });
+    }
+
+    const requester = await resolveUserDoc(requesterId);
+    if (!requester || conversation.groupAdmin.toString() !== requester._id.toString()) {
+      return res.status(403).json({ success: false, message: "Only the primary group admin can remove co-admins" });
+    }
+
+    const target = await resolveUserDoc(targetId);
+    if (!target) {
+      return res.status(404).json({ success: false, message: "Target user not found" });
+    }
+
+    if (conversation.groupCoAdmins) {
+      conversation.groupCoAdmins = conversation.groupCoAdmins.filter(id => id.toString() !== target._id.toString());
+      await conversation.save();
+    }
+
+    await conversation.populate("participants", "username name profilePicture isConnected userid lastConnectedAt");
+    await conversation.populate("groupCoAdmins", "username name profilePicture userid");
+
+    res.status(200).json({
+      success: true,
+      message: "User demoted from co-admin successfully",
+      conversation,
+    });
+  } catch (error) {
+    console.error("Error demoting co-admin:", error);
+    res.status(500).json({ success: false, message: "Failed to demote user" });
   }
 });
 

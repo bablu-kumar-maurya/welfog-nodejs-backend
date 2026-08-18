@@ -100,7 +100,7 @@ const createNotification = async ({
       id: notificationId,
       user_id: targetUserId,
       data: {
-        Type: "play",
+        Type: "Play",
         id: notificationId,
         message: formattedMessage,
         recipient: recipientObjectId,

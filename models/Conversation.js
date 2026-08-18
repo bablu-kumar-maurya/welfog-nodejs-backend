@@ -37,6 +37,12 @@ const conversationSchema = new mongoose.Schema(
         required: true,
       },
     ],
+    exitedUsers: [
+      {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "User4",
+      },
+    ],
     lastMessage: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "Message",

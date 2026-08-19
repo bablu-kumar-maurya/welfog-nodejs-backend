@@ -72,6 +72,11 @@ const conversationSchema = new mongoose.Schema(
       of: Date,
       default: {},
     },
+    joinedAt: {
+      type: Map,
+      of: Date,
+      default: {},
+    },
     inviteCode: {
       type: String,
       default: "",

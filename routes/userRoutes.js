@@ -946,10 +946,17 @@ router.get("/userlikedposts/:id", async (req, res) => {
 
 router.get("/userfollowing/:id", async (req, res) => {
   try {
-    const user = await User.findOne({
-      userid: req.params.id,
-      isDeleted: { $ne: true }, // Main user active hona chahiye
-    });
+    let query = { userid: req.params.id, isDeleted: { $ne: true } };
+    if (mongoose.isValidObjectId(req.params.id)) {
+      query = {
+        $or: [
+          { _id: req.params.id },
+          { userid: req.params.id }
+        ],
+        isDeleted: { $ne: true }
+      };
+    }
+    const user = await User.findOne(query);
 
     if (!user) {
       return res.status(404).json({ message: "User not found" });

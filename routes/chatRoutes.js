@@ -153,8 +153,10 @@ router.post("/conversations/group", async (req, res) => {
     }
 
     const initialUnread = {};
+    const initialJoinedAt = {};
     participantObjectIds.forEach((id) => {
       initialUnread[id.toString()] = 0;
+      initialJoinedAt[id.toString()] = new Date();
     });
 
     const conversation = new Conversation({
@@ -165,6 +167,7 @@ router.post("/conversations/group", async (req, res) => {
       groupAdmin: creator._id,
       participants: participantObjectIds,
       unreadCounts: initialUnread,
+      joinedAt: initialJoinedAt,
     });
 
     await conversation.save();
@@ -188,22 +191,51 @@ async function resolveConversationLastMessage(conv, userId) {
   const user = await resolveUserDoc(userId);
   if (!user) return conv;
 
-  if (conv.lastMessage && conv.lastMessage.deletedFor) {
-    const isDeleted = conv.lastMessage.deletedFor.some(
-      (id) => id.toString() === user._id.toString()
-    );
-    if (isDeleted) {
-      const Message = require("../models/Message");
-      const actualLastMessage = await Message.findOne({
-        conversation: conv._id,
-        deletedFor: { $ne: user._id }
-      })
+  let filterDate = null;
+  if (conv.joinedAt && conv.joinedAt[user._id.toString()]) {
+    filterDate = new Date(conv.joinedAt[user._id.toString()]);
+  }
+  if (conv.clearedAt && conv.clearedAt[user._id.toString()]) {
+    const clearDate = new Date(conv.clearedAt[user._id.toString()]);
+    if (!filterDate || clearDate > filterDate) {
+      filterDate = clearDate;
+    }
+  }
+
+  // First resolve if current last message was deleted for the user or sent before filterDate
+  let needQueryNewLast = false;
+  if (conv.lastMessage) {
+    if (conv.lastMessage.deletedFor) {
+      const isDeleted = conv.lastMessage.deletedFor.some(
+        (id) => id.toString() === user._id.toString()
+      );
+      if (isDeleted) needQueryNewLast = true;
+    }
+    
+    if (filterDate) {
+      const msgCreatedAt = conv.lastMessage.createdAt ? new Date(conv.lastMessage.createdAt) : null;
+      if (msgCreatedAt && msgCreatedAt < filterDate) {
+        needQueryNewLast = true;
+      }
+    }
+  }
+
+  if (needQueryNewLast) {
+    const Message = require("../models/Message");
+    const query = {
+      conversation: conv._id,
+      deletedFor: { $ne: user._id }
+    };
+    if (filterDate) {
+      query.createdAt = { $gte: filterDate };
+    }
+    const actualLastMessage = await Message.findOne(query)
       .sort({ createdAt: -1 })
       .populate("sender", "username name profilePicture userid")
       .lean();
-      conv.lastMessage = actualLastMessage;
-    }
+    conv.lastMessage = actualLastMessage;
   }
+
   return conv;
 }
 
@@ -224,10 +256,7 @@ router.get("/conversations", async (req, res) => {
     }
 
     const conversations = await Conversation.find({
-      $or: [
-        { participants: user._id },
-        { exitedUsers: user._id }
-      ],
+      participants: user._id,
       isDeleted: { $ne: true },
       deletedFor: { $ne: user._id },
     })
@@ -339,11 +368,33 @@ router.get("/conversations/:conversationId/messages", async (req, res) => {
     if (userId) {
       const user = await resolveUserDoc(userId);
       if (user) {
+        const conversation = await Conversation.findById(conversationId);
+        if (!conversation) {
+          return res.status(404).json({ success: false, message: "Conversation not found" });
+        }
+        
+        // Verify participant status
+        const isParticipant = conversation.participants.some(
+          (p) => p.toString() === user._id.toString()
+        );
+        if (!isParticipant) {
+          return res.status(403).json({ success: false, message: "You are not a participant in this conversation" });
+        }
+
         query.deletedFor = { $ne: user._id };
 
-        const conv = await Conversation.findById(conversationId).select("clearedAt").lean();
-        if (conv && conv.clearedAt && conv.clearedAt[user._id.toString()]) {
-          query.createdAt = { $gte: conv.clearedAt[user._id.toString()] };
+        let filterDate = null;
+        if (conversation.joinedAt && conversation.joinedAt.get(user._id.toString())) {
+          filterDate = conversation.joinedAt.get(user._id.toString());
+        }
+        if (conversation.clearedAt && conversation.clearedAt.get(user._id.toString())) {
+          const clearDate = conversation.clearedAt.get(user._id.toString());
+          if (!filterDate || clearDate > filterDate) {
+            filterDate = clearDate;
+          }
+        }
+        if (filterDate) {
+          query.createdAt = { $gte: filterDate };
         }
       }
     }
@@ -652,8 +703,28 @@ router.delete("/conversations/:conversationId", async (req, res) => {
 
     if (action === "for_everyone") {
       // Admin / Global Soft Delete
+      if (conversation.isGroup) {
+        const isAdmin = (conversation.groupAdmin && conversation.groupAdmin.toString() === user._id.toString()) ||
+                        (conversation.groupCoAdmins && conversation.groupCoAdmins.some((id) => id.toString() === user._id.toString()));
+        if (!isAdmin) {
+          return res.status(403).json({ success: false, message: "Only group admins can delete the group for everyone" });
+        }
+      } else {
+        const isParticipant = conversation.participants.some((id) => id.toString() === user._id.toString());
+        if (!isParticipant) {
+          return res.status(403).json({ success: false, message: "You are not a participant in this conversation" });
+        }
+      }
       conversation.isDeleted = true;
       await conversation.save();
+
+      // Force all sockets in the conversation room to leave immediately
+      const io = req.app.get("io");
+      if (io) {
+        const convRoom = `conv:${conversationId}`;
+        io.in(convRoom).socketsLeave(convRoom);
+        console.log(`🔌 Closed conversation room ${convRoom} for all users`);
+      }
 
       return res.status(200).json({
         success: true,
@@ -817,6 +888,8 @@ router.post("/conversations/:conversationId/participants", async (req, res) => {
         if (!conversation.participants.some((id) => id.toString() === pDoc._id.toString())) {
           conversation.participants.push(pDoc._id);
           conversation.unreadCounts.set(pDoc._id.toString(), 0);
+          if (!conversation.joinedAt) conversation.joinedAt = new Map();
+          conversation.joinedAt.set(pDoc._id.toString(), new Date());
         }
         if (conversation.exitedUsers) {
           conversation.exitedUsers = conversation.exitedUsers.filter((id) => id.toString() !== pDoc._id.toString());
@@ -828,7 +901,11 @@ router.post("/conversations/:conversationId/participants", async (req, res) => {
     }
 
     await conversation.save();
-    await conversation.populate("participants", "username name profilePicture isConnected userid lastConnectedAt");
+    await conversation.populate([
+      { path: "participants", select: "username name profilePicture isConnected userid lastConnectedAt" },
+      { path: "groupAdmin", select: "username name profilePicture userid" },
+      { path: "groupCoAdmins", select: "username name profilePicture userid" }
+    ]);
 
     res.status(200).json({
       success: true,
@@ -884,7 +961,20 @@ router.delete("/conversations/:conversationId/participants/:participantId", asyn
     }
 
     await conversation.save();
-    await conversation.populate("participants", "username name profilePicture isConnected userid lastConnectedAt");
+    await conversation.populate([
+      { path: "participants", select: "username name profilePicture isConnected userid lastConnectedAt" },
+      { path: "groupAdmin", select: "username name profilePicture userid" },
+      { path: "groupCoAdmins", select: "username name profilePicture userid" }
+    ]);
+
+    // Force target user to leave the socket conversation room immediately
+    const io = req.app.get("io");
+    if (io) {
+      const targetRoom = `user:${target._id.toString()}`;
+      const convRoom = `conv:${conversationId}`;
+      io.in(targetRoom).socketsLeave(convRoom);
+      console.log(`🔌 Forced user ${target._id.toString()} sockets to leave room ${convRoom}`);
+    }
 
     res.status(200).json({
       success: true,
@@ -925,7 +1015,11 @@ router.put("/conversations/:conversationId/group-info", async (req, res) => {
     if (groupDescription !== undefined) conversation.groupDescription = groupDescription;
 
     await conversation.save();
-    await conversation.populate("participants", "username name profilePicture isConnected userid lastConnectedAt");
+    await conversation.populate([
+      { path: "participants", select: "username name profilePicture isConnected userid lastConnectedAt" },
+      { path: "groupAdmin", select: "username name profilePicture userid" },
+      { path: "groupCoAdmins", select: "username name profilePicture userid" }
+    ]);
 
     res.status(200).json({
       success: true,
@@ -1101,6 +1195,8 @@ router.post("/groups/invite/:inviteCode/join", async (req, res) => {
     // Add user to participants
     conversation.participants.push(user._id);
     conversation.unreadCounts.set(user._id.toString(), 0);
+    if (!conversation.joinedAt) conversation.joinedAt = new Map();
+    conversation.joinedAt.set(user._id.toString(), new Date());
 
     if (conversation.exitedUsers) {
       conversation.exitedUsers = conversation.exitedUsers.filter((id) => id.toString() !== user._id.toString());
@@ -1111,7 +1207,11 @@ router.post("/groups/invite/:inviteCode/join", async (req, res) => {
 
     await conversation.save();
 
-    await conversation.populate("participants", "username name profilePicture isConnected userid lastConnectedAt");
+    await conversation.populate([
+      { path: "participants", select: "username name profilePicture isConnected userid lastConnectedAt" },
+      { path: "groupAdmin", select: "username name profilePicture userid" },
+      { path: "groupCoAdmins", select: "username name profilePicture userid" }
+    ]);
 
     res.status(200).json({
       success: true,
@@ -1200,8 +1300,11 @@ router.post("/conversations/:conversationId/co-admins", async (req, res) => {
       await conversation.save();
     }
 
-    await conversation.populate("participants", "username name profilePicture isConnected userid lastConnectedAt");
-    await conversation.populate("groupCoAdmins", "username name profilePicture userid");
+    await conversation.populate([
+      { path: "participants", select: "username name profilePicture isConnected userid lastConnectedAt" },
+      { path: "groupAdmin", select: "username name profilePicture userid" },
+      { path: "groupCoAdmins", select: "username name profilePicture userid" }
+    ]);
 
     res.status(200).json({
       success: true,
@@ -1240,8 +1343,11 @@ router.delete("/conversations/:conversationId/co-admins/:targetId", async (req, 
       await conversation.save();
     }
 
-    await conversation.populate("participants", "username name profilePicture isConnected userid lastConnectedAt");
-    await conversation.populate("groupCoAdmins", "username name profilePicture userid");
+    await conversation.populate([
+      { path: "participants", select: "username name profilePicture isConnected userid lastConnectedAt" },
+      { path: "groupAdmin", select: "username name profilePicture userid" },
+      { path: "groupCoAdmins", select: "username name profilePicture userid" }
+    ]);
 
     res.status(200).json({
       success: true,

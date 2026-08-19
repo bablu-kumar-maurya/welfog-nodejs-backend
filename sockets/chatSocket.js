@@ -172,11 +172,32 @@ function initChatSockets(io) {
     });
 
     // 2️⃣ Join Conversation Room
-    socket.on("join_conversation", ({ conversationId }) => {
+    socket.on("join_conversation", async ({ conversationId }) => {
       if (conversationId) {
-        const roomName = `conv:${conversationId}`;
-        socket.join(roomName);
-        console.log(`💬 Socket ${socket.id} joined ${roomName}`);
+        try {
+          if (currentUserId) {
+            const userDoc = await resolveUserDoc(currentUserId);
+            if (userDoc) {
+              const conversation = await Conversation.findById(conversationId);
+              if (conversation) {
+                const isParticipant = conversation.participants.some(
+                  (p) => p.toString() === userDoc._id.toString()
+                );
+                if (!isParticipant) {
+                  console.log(`⚠️ Socket ${socket.id} (user: ${currentUserId}) blocked from joining ${conversationId}: not a participant`);
+                  return;
+                }
+              }
+            }
+          }
+          const roomName = `conv:${conversationId}`;
+          socket.join(roomName);
+          console.log(`💬 Socket ${socket.id} joined ${roomName}`);
+        } catch (e) {
+          console.error("Error in join_conversation socket check:", e);
+          const roomName = `conv:${conversationId}`;
+          socket.join(roomName);
+        }
       }
     });
 
@@ -227,6 +248,18 @@ function initChatSockets(io) {
           console.error(`❌ [Socket] Send failed: Conversation '${conversationId}' not found`);
           if (callback) callback({ success: false, message: "Conversation not found" });
           return;
+        }
+
+        // Verify if sender is a participant of the group
+        if (conversation.isGroup) {
+          const isSenderParticipant = conversation.participants.some(
+            (p) => p.toString() === senderDoc._id.toString()
+          );
+          if (!isSenderParticipant) {
+            console.error(`❌ [Socket] Send failed: User '${senderId}' is not a participant in group '${conversationId}'`);
+            if (callback) callback({ success: false, message: "You are not a participant in this group" });
+            return;
+          }
         }
 
         // Bidirectional Block Check for 1-to-1 chats

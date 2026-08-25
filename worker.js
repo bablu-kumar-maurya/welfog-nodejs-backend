@@ -206,7 +206,7 @@ async function downloadFileToTemp(url, ext = '.tmp') {
                 return reject(new Error('Exceeded maximum redirects.')); 
             }
             const getter = (fileUrl.startsWith("http://") ? http : https);
-            getter.get(fileUrl, (response) => {
+            const req = getter.get(fileUrl, (response) => {
                 const statusCode = response.statusCode;
                 if (statusCode >= 300 && statusCode < 400 && response.headers.location) {
                     redirects++; currentUrl = new URL(response.headers.location, fileUrl).href; 
@@ -232,7 +232,13 @@ async function downloadFileToTemp(url, ext = '.tmp') {
                 tmpFile.removeCallback(); 
                 console.error(`❌ [downloadFileToTemp] Failed with Status Code: ${statusCode}`);
                 return reject(new Error(`Failed to download file, Status Code: ${statusCode}`));
-            }).on("error", (err) => { 
+            });
+            req.setTimeout(300000, () => {
+                req.destroy();
+                tmpFile.removeCallback();
+                reject(new Error("Download socket timeout after 5 minutes"));
+            });
+            req.on("error", (err) => { 
                 tmpFile.removeCallback(); 
                 console.error("❌ [downloadFileToTemp] HTTP request error:", err);
                 reject(err); 
@@ -245,7 +251,7 @@ async function downloadFileToTemp(url, ext = '.tmp') {
 // =================================================================
 // === 3. CORE WORKER PROCESSING FUNCTION ===
 // =================================================================
-async function processReelUpload(jobData) {
+async function processReelUpload(jobData, job = null) {
     console.log(`\n======================================================`);
     console.log(`🚀 [WORKER: FULL UPLOAD JOB STARTED for user ${jobData.userid}]`);
     console.log(`🔍 [JOB DATA RECIEVED] Reel ID: ${jobData.reelId}, RawVideoUrl: ${jobData.rawVideoUrl ? "YES" : "NO"}`);
@@ -283,44 +289,77 @@ async function processReelUpload(jobData) {
         tempFiles.push(inputTmp);
         console.log(`✅ Raw Video downloaded to: ${inputTmp.name}`);
 
+        // 📏 Check File Size (Max 200MB limit)
+        const rawFileSizeMB = fs.statSync(inputTmp.name).size / (1024 * 1024);
+        console.log(`📊 Raw Video File Size: ${rawFileSizeMB.toFixed(2)} MB`);
+        if (rawFileSizeMB > 200) {
+            console.error(`❌ Raw video file size (${rawFileSizeMB.toFixed(2)}MB) exceeds maximum limit of 200MB.`);
+            throw new Error(`Video file size (${rawFileSizeMB.toFixed(2)}MB) exceeds 200MB limit.`);
+        }
+
+        if (job && job.updateProgress) await job.updateProgress(20);
+
         const outputTmp = tmp.fileSync({ postfix: ".mp4" });
         tempFiles.push(outputTmp);
 
         let videoToCompressPath = inputTmp.name;
+        const totalMediaDuration = await getMediaDurationSec(inputTmp.name);
+        console.log(`⏱️ Total Media Duration: ${totalMediaDuration.toFixed(2)}s`);
+
         const videoStartMs = parseFloat(videoStartTime);
         const videoEndMs = parseFloat(videoEndTime);
         
-        console.log(`⏱️ Video Trim Info: Start=${videoStartMs}ms, End=${videoEndMs}ms`);
+        let startSec = 0;
+        let dur = 0;
+        let shouldTrim = false;
+
         if (Number.isFinite(videoStartMs) && Number.isFinite(videoEndMs)) {
-            const startSec = videoStartMs / 1000;
-            const dur = (videoEndMs - videoStartMs) / 1000;
+            startSec = Math.max(0, videoStartMs / 1000);
+            dur = (videoEndMs - videoStartMs) / 1000;
             if (dur > 0) {
-                console.log(`✂️ Trimming video... Start: ${startSec}s, Duration: ${dur}s`);
-                const trimmedTmp = tmp.fileSync({ postfix: ".mp4" });
-                tempFiles.push(trimmedTmp);
-                await new Promise((resolve, reject) => {
-                    ffmpeg(inputTmp.name).seekInput(startSec).duration(dur)
-                        .outputOptions(["-c", "copy", "-y"])
-                        .save(trimmedTmp.name)
-                        .on("end", () => { console.log("✅ Video trim complete (copied streams)."); resolve(); })
-                        .on("error", (err) => {
-                            console.warn("⚠️ Video trim with copy failed, attempting transcode trim fallback...", err.message);
-                            // Fallback to transcode trim: converts video to libx264, standard 8-bit yuv420p, and audio to aac
-                            ffmpeg(inputTmp.name).seekInput(startSec).duration(dur)
-                                .outputOptions([
-                                    "-c:v", "libx264",
-                                    "-pix_fmt", "yuv420p",
-                                    "-c:a", "aac",
-                                    "-b:a", "128k",
-                                    "-y"
-                                ])
-                                .save(trimmedTmp.name)
-                                .on("end", () => { console.log("✅ Video trim complete (transcoded fallback)."); resolve(); })
-                                .on("error", (err2) => { console.error("❌ Video trim fallback failed:", err2); reject(err2); });
-                        });
-                });
-                videoToCompressPath = trimmedTmp.name;
+                shouldTrim = true;
+                if (dur > 45) {
+                    console.log(`⚠️ Trim duration (${dur}s) exceeds 45s maximum limit. Capping to 45s.`);
+                    dur = 45;
+                }
             }
+        }
+
+        // If no valid trim bounds passed, but overall video > 45s, force trim to max 45s
+        if (!shouldTrim && totalMediaDuration > 45) {
+            console.log(`⚠️ Video duration (${totalMediaDuration.toFixed(2)}s) exceeds 45s maximum limit. Auto-trimming to 45s...`);
+            startSec = 0;
+            dur = 45;
+            shouldTrim = true;
+        }
+
+        console.log(`⏱️ Final Trim Decision: shouldTrim=${shouldTrim}, Start=${startSec}s, Duration=${dur}s`);
+
+        if (shouldTrim && dur > 0) {
+            console.log(`✂️ Trimming video... Start: ${startSec}s, Duration: ${dur}s`);
+            const trimmedTmp = tmp.fileSync({ postfix: ".mp4" });
+            tempFiles.push(trimmedTmp);
+            await new Promise((resolve, reject) => {
+                ffmpeg(inputTmp.name).seekInput(startSec).duration(dur)
+                    .outputOptions(["-c", "copy", "-y"])
+                    .save(trimmedTmp.name)
+                    .on("end", () => { console.log("✅ Video trim complete (copied streams)."); resolve(); })
+                    .on("error", (err) => {
+                        console.warn("⚠️ Video trim with copy failed, attempting transcode trim fallback...", err.message);
+                        ffmpeg(inputTmp.name).seekInput(startSec).duration(dur)
+                            .outputOptions([
+                                "-c:v", "libx264",
+                                "-pix_fmt", "yuv420p",
+                                "-c:a", "aac",
+                                "-b:a", "128k",
+                                "-y"
+                            ])
+                            .save(trimmedTmp.name)
+                            .on("end", () => { console.log("✅ Video trim complete (transcoded fallback)."); resolve(); })
+                            .on("error", (err2) => { console.error("❌ Video trim fallback failed:", err2); reject(err2); });
+                    });
+            });
+            videoToCompressPath = trimmedTmp.name;
         }
 
         console.log("-> ⚡ BYPASSING Backend Compression for Faster Upload...");
@@ -548,17 +587,17 @@ async function processReelUpload(jobData) {
                 return uploadToS3({ buffer, originalname: file, mimetype }, s3Folder, true);
             });
             while (uploadPromises.length > 0) { 
-                await Promise.all(uploadPromises.splice(0, 4)); 
+                await Promise.all(uploadPromises.splice(0, 12)); 
             }
             console.log(`✅ Upload complete for ${variant.name}`);
         };
 
         await generateAndUploadVariant({ name: "480p", resolution: "854x480", videoBitrate: "1100k", audioBitrate: "128k", bandwidth: 1400000, hlsTime: 2 });
 
-        console.log("📝 Generating Master Playlist (m3u8)...");
-        const masterPlaylistContent = `#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-STREAM-INF:BANDWIDTH=380000,RESOLUTION=426x240\n240p/index.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=1400000,RESOLUTION=854x480\n480p/index.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720\n720p/index.m3u8\n`;
-        fs.writeFileSync(path.join(hlsDir, "master.m3u8"), masterPlaylistContent);
-        console.log("📤 Uploading Master Playlist to S3...");
+        console.log("📝 Generating Initial Master Playlist for 480p (m3u8)...");
+        const initialMasterPlaylist = `#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-STREAM-INF:BANDWIDTH=1400000,RESOLUTION=854x480\n480p/index.m3u8\n`;
+        fs.writeFileSync(path.join(hlsDir, "master.m3u8"), initialMasterPlaylist);
+        console.log("📤 Uploading Initial Master Playlist (480p) to S3...");
         await uploadToS3({ buffer: fs.readFileSync(path.join(hlsDir, "master.m3u8")), originalname: "master.m3u8", mimetype: "application/vnd.apple.mpegurl" }, `videos/reels/${newReelId}`, true);
 
         // THUMBNAIL LOGIC
@@ -643,39 +682,55 @@ async function processReelUpload(jobData) {
         savedReel.status = 'Published'; 
         savedReel.qualityVariants = ["480p"];
         await savedReel.save();
-        console.log("===== 🟢 [PRIORITY DONE: REEL IS PUBLISHED & LIVE!] =====");
+        console.log("===== 🟢 [PRIORITY DONE: REEL IS PUBLISHED & LIVE AT 480P!] =====");
 
-        console.log("⚙️ Starting background generation of remaining qualities (240p, 720p)...");
-        const remainingVariants = [
-            { name: "240p", resolution: "426x240", videoBitrate: "350k", audioBitrate: "64k", bandwidth: 450000, hlsTime: 2 },
-            { name: "720p", resolution: "1280x720", videoBitrate: "2000k", audioBitrate: "160k", bandwidth: 2500000, hlsTime: 2 }
-        ];
-        for (const variant of remainingVariants) {
-            await generateAndUploadVariant(variant);
-        }
+        // 🚀 NON-BLOCKING BACKGROUND ENCODING FOR 720P (HD)
+        (async () => {
+            try {
+                console.log("⚙️ Starting background generation of remaining qualities (720p)...");
+                const remainingVariants = [
+                    { name: "720p", resolution: "1280x720", videoBitrate: "2000k", audioBitrate: "160k", bandwidth: 2500000, hlsTime: 2 }
+                ];
+                for (const variant of remainingVariants) {
+                    await generateAndUploadVariant(variant);
+                }
 
-        console.log("💾 Updating Reel DB document with all quality variants...");
-        await Reel.findByIdAndUpdate(newReelId, { $addToSet: { qualityVariants: { $each: ["240p", "720p"] } } });
-        console.log("===== 🎉 [WORKER: FULL UPLOAD SUCCESS - ALL QUALITIES READY] =====");
+                console.log("📝 Updating Master Playlist on S3 to include 720p (HD)...");
+                const updatedMasterPlaylist = `#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-STREAM-INF:BANDWIDTH=1400000,RESOLUTION=854x480\n480p/index.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720\n720p/index.m3u8\n`;
+                fs.writeFileSync(path.join(hlsDir, "master.m3u8"), updatedMasterPlaylist);
+                await uploadToS3({ buffer: fs.readFileSync(path.join(hlsDir, "master.m3u8")), originalname: "master.m3u8", mimetype: "application/vnd.apple.mpegurl" }, `videos/reels/${newReelId}`, true);
 
-        // ========================================================
-        // 🗑️ STORAGE OPTIMIZATION: Delete Raw MP4 from S3 after processing
-        // ========================================================
-        try {
-            if (rawVideoUrl) {
-                const urlObj = new URL(rawVideoUrl);
-                const rawKey = urlObj.pathname.startsWith('/') ? urlObj.pathname.substring(1) : urlObj.pathname;
-                console.log(`🧹 Cleaning up S3... Deleting raw file: ${rawKey}`);
-                
-                await s3.send(new DeleteObjectCommand({
-                    Bucket: process.env.AWS_BUCKET_NAME,
-                    Key: decodeURIComponent(rawKey),
-                }));
-                console.log("✅ Raw MP4 deleted successfully! Storage space saved.");
+                console.log("💾 Updating Reel DB document with all quality variants...");
+                await Reel.findByIdAndUpdate(newReelId, { $addToSet: { qualityVariants: "720p" } });
+                console.log("===== 🎉 [BACKGROUND 720P ENCODING SUCCESSFUL] =====");
+
+                // 🗑️ STORAGE OPTIMIZATION: Delete Raw MP4 from S3 after background processing
+                if (rawVideoUrl) {
+                    const urlObj = new URL(rawVideoUrl);
+                    const rawKey = urlObj.pathname.startsWith('/') ? urlObj.pathname.substring(1) : urlObj.pathname;
+                    console.log(`🧹 Cleaning up S3... Deleting raw file: ${rawKey}`);
+                    
+                    await s3.send(new DeleteObjectCommand({
+                        Bucket: process.env.AWS_BUCKET_NAME,
+                        Key: decodeURIComponent(rawKey),
+                    }));
+                    console.log("✅ Raw MP4 deleted successfully!");
+                }
+            } catch (bgErr) {
+                console.error("⚠️ Background 720p encoding error (non-blocking):", bgErr.message);
+            } finally {
+                console.log("🧹 Running background local cleanup for temp files...");
+                tempFiles.forEach((t) => { 
+                    try { if (t) t.removeCallback(); } catch (e) { console.error("Temp file delete err:", e); } 
+                });
+                if (hlsDir) { 
+                    try { fs.rmSync(hlsDir, { recursive: true, force: true }); } catch (e) { console.error("HLS dir delete err:", e); } 
+                }
+                console.log("✅ Background cleanup done.");
             }
-        } catch (deleteError) {
-            console.error("⚠ Non-blocking Error: Raw MP4 delete nahi ho payi:", deleteError.message);
-        }
+        })();
+
+        return savedReel;
 
     } catch (err) {
         console.error("\n===== ❌ [WORKER: FULL UPLOAD FATAL ERROR] =====");
@@ -684,16 +739,13 @@ async function processReelUpload(jobData) {
             console.log(`⚠️ Updating Reel ${newReelId} status to 'failed' in DB...`);
             await Reel.findByIdAndUpdate(newReelId, { status: 'failed', error: err.message });
         }
-        throw err;
-    } finally {
-        console.log("🧹 Running local cleanup for temp files...");
         tempFiles.forEach((t) => { 
-            try { if (t) t.removeCallback(); } catch (e) { console.error("Temp file delete err:", e); } 
+            try { if (t) t.removeCallback(); } catch (e) {} 
         });
         if (hlsDir) { 
-            try { fs.rmSync(hlsDir, { recursive: true, force: true }); } catch (e) { console.error("HLS dir delete err:", e); } 
+            try { fs.rmSync(hlsDir, { recursive: true, force: true }); } catch (e) {} 
         }
-        console.log("✅ Cleanup done. Worker ready for next job.\n======================================================\n");
+        throw err;
     }
 }
 
@@ -705,8 +757,14 @@ redisConnection.on('error', (err) => console.error("❌ Redis connection error:"
 
 const worker = new Worker('reel-processing', async job => {
     console.log(`\n🔔 Worker picked up job ID: ${job.id}`);
-    await processReelUpload(job.data);
-}, { connection: redisConnection, concurrency: 4 }); // concurrency 4 means it processes 4 videos simultaneously
+    await processReelUpload(job.data, job);
+}, {
+    connection: redisConnection,
+    concurrency: 4,
+    lockDuration: 600000, // 10 minutes (600,000 ms) lock duration to prevent job stalling on 30s+ / 50MB-100MB videos
+    stalledInterval: 30000,
+    maxStalledCount: 3
+}); // concurrency 4 means it processes 4 videos simultaneously
 
 worker.on('active', job => { console.log(`▶️ Job ${job.id} is now ACTIVE.`); });
 worker.on('completed', job => { console.log(`🏁 Job ${job.id} has COMPLETED successfully!`); });

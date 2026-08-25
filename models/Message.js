@@ -62,6 +62,10 @@ const messageSchema = new mongoose.Schema(
       type: String,
       default: "",
     },
+    duration: {
+      type: Number,
+      default: 0,
+    },
     sharedReel: {
       reelId: { type: String, default: "" },
       videoUrl: { type: String, default: "" },

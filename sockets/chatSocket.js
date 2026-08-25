@@ -171,6 +171,26 @@ function initChatSockets(io) {
       }
     });
 
+    // 1.5️⃣ Get presence explicitly
+    socket.on("get_presence", async ({ userId }) => {
+      if (userId) {
+        try {
+          const user = await resolveUserDoc(userId);
+          if (user) {
+            const isOnline = isUserOnline(user._id.toString()) || isUserOnline(user.userid);
+            socket.emit("presence_change", {
+              userId: user._id.toString(),
+              customUserId: user.userid,
+              isOnline: isOnline,
+              lastSeen: user.lastConnectedAt || null,
+            });
+          }
+        } catch (e) {
+          console.error("Error in get_presence handler:", e);
+        }
+      }
+    });
+
     // 2️⃣ Join Conversation Room
     socket.on("join_conversation", async ({ conversationId }) => {
       if (conversationId) {
@@ -227,6 +247,7 @@ function initChatSockets(io) {
           sharedReel = null,
           sharedProduct = null,
           tempId = null,
+          duration = 0,
         } = data;
 
         console.log(`💬 [Socket] send_message attempt: conv=${conversationId}, sender=${senderId}, type=${type}`);
@@ -313,6 +334,7 @@ function initChatSockets(io) {
           fileName,
           fileSize,
           mimeType,
+          duration: Number(duration) || 0,
           replyTo: replyTo && mongoose.isValidObjectId(replyTo) ? replyTo : null,
           sharedReel: sharedReel || null,
           sharedProduct: sharedProduct || null,
@@ -368,6 +390,18 @@ function initChatSockets(io) {
 
         const messageData = newMessage.toObject();
         if (tempId) messageData.tempId = tempId;
+
+        // Trigger push notifications for recipients
+        try {
+          const sendChatPushNotification = require("../utils/sendChatPushNotification");
+          sendChatPushNotification({
+            conversation,
+            senderDoc,
+            messageDoc: newMessage,
+          });
+        } catch (err) {
+          console.error("❌ Failed to trigger chat push notification:", err.message);
+        }
 
         // Broadcast to conversation room or only to the sender if blocked
         if (isReceiverBlocked) {

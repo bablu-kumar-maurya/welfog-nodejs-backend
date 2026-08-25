@@ -55,10 +55,15 @@ router.post("/generate-upload-url", async (req, res) => {
     console.log("📦 Request Body:", req.body);
 
     try {
-        const { filename, fileType, isThumbnail } = req.body;
+        const { filename, fileType, isThumbnail, fileSize } = req.body;
         if (!filename || !fileType) {
             console.warn("⚠️ [generate-upload-url] Missing filename or fileType in request.");
             return res.status(400).json({ success: false, message: "filename and fileType are required" });
+        }
+
+        if (fileSize && Number(fileSize) > 200 * 1024 * 1024) {
+            console.warn(`⚠️ [generate-upload-url] File size ${fileSize} exceeds maximum limit of 200MB.`);
+            return res.status(400).json({ success: false, message: "File size exceeds maximum allowed limit of 200MB." });
         }
 
         const folder = isThumbnail ? "thumbnails/raw" : "videos/raw";

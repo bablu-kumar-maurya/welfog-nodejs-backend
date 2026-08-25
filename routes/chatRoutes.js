@@ -451,6 +451,7 @@ router.post("/conversations/:conversationId/messages", async (req, res) => {
       sharedReel = null,
       sharedProduct = null,
       tempId = null,
+      duration = 0,
     } = req.body;
 
     if (!mongoose.isValidObjectId(conversationId)) {
@@ -519,6 +520,7 @@ router.post("/conversations/:conversationId/messages", async (req, res) => {
       fileName,
       fileSize,
       mimeType,
+      duration: Number(duration) || 0,
       replyTo: replyTo && mongoose.isValidObjectId(replyTo) ? replyTo : null,
       sharedReel: sharedReel || null,
       sharedProduct: sharedProduct || null,
@@ -560,6 +562,18 @@ router.post("/conversations/:conversationId/messages", async (req, res) => {
 
     const messageData = newMessage.toObject();
     if (tempId) messageData.tempId = tempId;
+
+    // Trigger push notifications for recipients
+    try {
+      const sendChatPushNotification = require("../utils/sendChatPushNotification");
+      sendChatPushNotification({
+        conversation,
+        senderDoc,
+        messageDoc: newMessage,
+      });
+    } catch (err) {
+      console.error("❌ Failed to trigger chat push notification:", err.message);
+    }
 
     const io = req.app.get("io");
     if (io) {

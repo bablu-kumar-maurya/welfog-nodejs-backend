@@ -16,9 +16,9 @@ require('dotenv').config();
 const { DeleteObjectCommand } = require("@aws-sdk/client-s3");
 
 // Apne DB models require karo
-const Reel = require("./models/Reel"); 
+const Reel = require("./models/Reel");
 const User = require("./models/Users");
-const Music = require("./models/Music"); 
+const Music = require("./models/Music");
 const { uploadToS3, s3, deleteFileFromS3 } = require("./lib/s3"); // S3 client aur upload function
 const { generateShortLink } = require("./utils/shortLink");
 
@@ -59,82 +59,31 @@ async function compressVideo(inputPath, outputPath) {
             "-c:v libx264", `-b:v ${bps}k`, `-maxrate ${bps}k`, `-bufsize ${bps * 2}k`, `-crf ${crf}`,
             "-preset veryfast", "-c:a aac", "-b:a 128k", "-movflags +faststart", "-y"
         ]).save(outputPath)
-          .on("end", () => { console.log("✅ [compressVideo] Completed!"); resolve(); })
-          .on("error", (err) => { console.error("❌ [compressVideo] Error:", err); reject(err); });
+            .on("end", () => { console.log("✅ [compressVideo] Completed!"); resolve(); })
+            .on("error", (err) => { console.error("❌ [compressVideo] Error:", err); reject(err); });
     });
 }
 
 async function compressImageToWebP(inputPath, outputPath) {
-    console.log(`🖼️ [compressImageToWebP] Started: ${inputPath} -> ${outputPath}`);
-    let qVal = 75; // Initial quality (0 to 100)
-    const minSize = 30 * 1024; // 30 KB
-    const maxSize = 40 * 1024; // 40 KB
-    let bestQ = qVal;
-    let bestSizeDiff = Infinity;
-    
-    for (let attempt = 0; attempt < 5; attempt++) {
-        await new Promise((resolve, reject) => {
-            ffmpeg(inputPath)
-                .outputOptions([
-                    '-c:v', 'libwebp',
-                    '-q:v', String(qVal)
-                ])
-                .output(outputPath)
-                .on('end', resolve)
-                .on('error', (err) => {
-                    console.error("❌ FFmpeg webp compress error:", err);
-                    reject(err);
-                })
-                .run();
-        });
-        
-        const stats = fs.statSync(outputPath);
-        const sizeKB = stats.size / 1024;
-        console.log(`🖼️ [compressImageToWebP] Attempt ${attempt}: Q=${qVal}, Size=${sizeKB.toFixed(2)} KB`);
-        
-        if (stats.size >= minSize && stats.size <= maxSize) {
-            console.log(`✅ [compressImageToWebP] Perfect match found! Q=${qVal}, Size=${sizeKB.toFixed(2)} KB`);
-            return;
-        }
-        
-        if (stats.size < minSize && qVal >= 85) {
-            console.log(`ℹ️ [compressImageToWebP] Size is under 30KB but quality is high (Q=${qVal}). Keeping it to preserve quality.`);
-            return;
-        }
-        
-        // Track the best choice so far
-        const diff = Math.min(Math.abs(stats.size - minSize), Math.abs(stats.size - maxSize));
-        if (diff < bestSizeDiff) {
-            bestSizeDiff = diff;
-            bestQ = qVal;
-        }
-        
-        if (stats.size > maxSize) {
-            qVal -= 10; // reduce quality to make size smaller
-        } else {
-            qVal += 8; // increase quality to make size larger
-        }
-        
-        if (qVal < 10 || qVal > 95) {
-            break;
-        }
-    }
-    
-    // If we didn't find a perfect size within the range, run one last time with the bestQ
-    if (qVal !== bestQ) {
-        console.log(`🖼️ [compressImageToWebP] Finalizing with best Q=${bestQ}`);
-        await new Promise((resolve, reject) => {
-            ffmpeg(inputPath)
-                .outputOptions([
-                    '-c:v', 'libwebp',
-                    '-q:v', String(bestQ)
-                ])
-                .output(outputPath)
-                .on('end', resolve)
-                .on('error', reject)
-                .run();
-        });
-    }
+    console.log(`🖼️ [compressImageToWebP] Starting single-pass WebP compression for: ${inputPath} -> ${outputPath}`);
+    await new Promise((resolve, reject) => {
+        ffmpeg(inputPath)
+            .outputOptions([
+                '-c:v', 'libwebp',
+                '-q:v', '70'
+            ])
+            .output(outputPath)
+            .on('end', () => {
+                const stats = fs.statSync(outputPath);
+                console.log(`✅ [compressImageToWebP] Compression completed. WebP size: ${(stats.size / 1024).toFixed(2)} KB`);
+                resolve();
+            })
+            .on('error', (err) => {
+                console.error("❌ FFmpeg webp compress error:", err);
+                reject(err);
+            })
+            .run();
+    });
 }
 
 
@@ -183,14 +132,14 @@ async function muxMusicOverVideo({ videoPath, audioPath, outputPath, musicStartS
     return new Promise((resolve, reject) => {
         const cmd = ffmpeg(videoPath).input(audioPath);
         if (mixOriginal) {
-            cmd.complexFilter([ `[0:a]volume=${ov.toFixed(4)}[orig]`, `${trimmedMusic}[music]`, `[orig][music]amix=inputs=2:duration=first:dropout_transition=0[aout]` ]);
+            cmd.complexFilter([`[0:a]volume=${ov.toFixed(4)}[orig]`, `${trimmedMusic}[music]`, `[orig][music]amix=inputs=2:duration=first:dropout_transition=0[aout]`]);
         } else {
             cmd.complexFilter([`${trimmedMusic}[aout]`]);
         }
-        cmd.outputOptions([ "-map", "0:v", "-map", "[aout]", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", "-y" ]);
+        cmd.outputOptions(["-map", "0:v", "-map", "[aout]", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", "-y"]);
         cmd.save(outputPath)
-           .on("end", () => { console.log("✅ [muxMusicOverVideo] Muxing completed!"); resolve(); })
-           .on("error", (err) => { console.error("❌ [muxMusicOverVideo] Error:", err); reject(err); });
+            .on("end", () => { console.log("✅ [muxMusicOverVideo] Muxing completed!"); resolve(); })
+            .on("error", (err) => { console.error("❌ [muxMusicOverVideo] Error:", err); reject(err); });
     });
 }
 
@@ -200,36 +149,36 @@ async function downloadFileToTemp(url, ext = '.tmp') {
     const tmpFile = tmp.fileSync({ postfix: ext });
     return new Promise((resolve, reject) => {
         function getFile(fileUrl) {
-            if (redirects >= MAX_REDIRECTS) { 
-                tmpFile.removeCallback(); 
+            if (redirects >= MAX_REDIRECTS) {
+                tmpFile.removeCallback();
                 console.error("❌ [downloadFileToTemp] Exceeded maximum redirects.");
-                return reject(new Error('Exceeded maximum redirects.')); 
+                return reject(new Error('Exceeded maximum redirects.'));
             }
             const getter = (fileUrl.startsWith("http://") ? http : https);
             const req = getter.get(fileUrl, (response) => {
                 const statusCode = response.statusCode;
                 if (statusCode >= 300 && statusCode < 400 && response.headers.location) {
-                    redirects++; currentUrl = new URL(response.headers.location, fileUrl).href; 
+                    redirects++; currentUrl = new URL(response.headers.location, fileUrl).href;
                     console.log(`🔄 [downloadFileToTemp] Redirecting to: ${currentUrl.substring(0, 50)}...`);
-                    response.resume(); return getFile(currentUrl); 
+                    response.resume(); return getFile(currentUrl);
                 }
                 if (statusCode === 200) {
                     const file = fs.createWriteStream(tmpFile.name);
                     response.pipe(file);
-                    file.on("finish", () => { 
+                    file.on("finish", () => {
                         file.close(() => {
                             console.log(`✅ [downloadFileToTemp] Download finished. Saved at: ${tmpFile.name}`);
                             resolve(tmpFile);
-                        }); 
+                        });
                     });
-                    file.on("error", (err) => { 
-                        tmpFile.removeCallback(); 
+                    file.on("error", (err) => {
+                        tmpFile.removeCallback();
                         console.error("❌ [downloadFileToTemp] File write error:", err);
-                        reject(err); 
+                        reject(err);
                     });
                     return;
                 }
-                tmpFile.removeCallback(); 
+                tmpFile.removeCallback();
                 console.error(`❌ [downloadFileToTemp] Failed with Status Code: ${statusCode}`);
                 return reject(new Error(`Failed to download file, Status Code: ${statusCode}`));
             });
@@ -238,10 +187,10 @@ async function downloadFileToTemp(url, ext = '.tmp') {
                 tmpFile.removeCallback();
                 reject(new Error("Download socket timeout after 5 minutes"));
             });
-            req.on("error", (err) => { 
-                tmpFile.removeCallback(); 
+            req.on("error", (err) => {
+                tmpFile.removeCallback();
                 console.error("❌ [downloadFileToTemp] HTTP request error:", err);
-                reject(err); 
+                reject(err);
             });
         }
         getFile(currentUrl);
@@ -255,9 +204,9 @@ async function processReelUpload(jobData, job = null) {
     console.log(`\n======================================================`);
     console.log(`🚀 [WORKER: FULL UPLOAD JOB STARTED for user ${jobData.userid}]`);
     console.log(`🔍 [JOB DATA RECIEVED] Reel ID: ${jobData.reelId}, RawVideoUrl: ${jobData.rawVideoUrl ? "YES" : "NO"}`);
-    
+
     const { rawVideoUrl, rawThumbnailUrl, videoOriginalname, reelId: existingReelId, externalAudioData, ...reelMetadata } = jobData;
-    
+
     const {
         user, userid, username, name, caption, musicId,
         videoStartTime, videoEndTime, musicStartTime, musicEndTime,
@@ -272,6 +221,7 @@ async function processReelUpload(jobData, job = null) {
     let savedReel = null;
     let hlsDir = null;
     let videoHasAudio = false;
+    let originalAudioToExtract = false;
 
     try {
         if (newReelId) {
@@ -308,7 +258,7 @@ async function processReelUpload(jobData, job = null) {
 
         const videoStartMs = parseFloat(videoStartTime);
         const videoEndMs = parseFloat(videoEndTime);
-        
+
         let startSec = 0;
         let dur = 0;
         let shouldTrim = false;
@@ -369,7 +319,7 @@ async function processReelUpload(jobData, job = null) {
 
         let shouldReplaceAudio = false;
         let audioInputPath = null;
-        let audioDuration = 0; 
+        let audioDuration = 0;
 
         if (externalAudioData && externalAudioData.url && (!musicId || !mongoose.Types.ObjectId.isValid(musicId))) {
             console.log("[STEP 3.0] 🎵 Processing external audio data from body (new Music track)...");
@@ -387,7 +337,7 @@ async function processReelUpload(jobData, job = null) {
                     console.log("📥 Downloading existing music file...");
                     const musicTmpObj = await downloadFileToTemp(existingMusic.url, ext);
                     tempFiles.push(musicTmpObj);
-                    audioInputPath = musicTmpObj.name;  
+                    audioInputPath = musicTmpObj.name;
                 } else {
                     console.log("🆕 New external music detected. Downloading...");
                     const ext = path.extname(new URL(externalAudioData.url).pathname) || '.mp3';
@@ -433,7 +383,7 @@ async function processReelUpload(jobData, job = null) {
                 console.log("✅ Music file downloaded.");
             }
         }
-        
+
         if (shouldReplaceAudio) {
             console.log("🔀 Replacing/Muxing audio into video...");
             const replacedTmp = tmp.fileSync({ postfix: ".mp4" });
@@ -454,14 +404,13 @@ async function processReelUpload(jobData, job = null) {
             videoHasAudio = true;
         } else {
             console.log("🎧 No external audio replace requested. Checking for original audio stream...");
-            
-            // 🔥 FIXED LOGIC: Pehle check karo ki video mein audio track hai ya nahi
+
+            // 🔥 Check if video has an audio stream, and defer extraction to background
             const hasAudio = await new Promise((resolve) => {
                 ffmpeg.ffprobe(outputTmp.name, (err, metadata) => {
                     if (err) {
                         resolve(false);
                     } else {
-                        // Check if streams exist and find audio
                         const audioStream = metadata.streams && metadata.streams.find(s => s.codec_type === 'audio');
                         resolve(!!audioStream);
                     }
@@ -469,39 +418,12 @@ async function processReelUpload(jobData, job = null) {
             });
 
             if (hasAudio) {
-                console.log("🔉 Original audio stream found. Extracting...");
-                const extractedAudioTmp = tmp.fileSync({ postfix: ".mp3" });
-                tempFiles.push(extractedAudioTmp);
-                await new Promise((resolve, reject) => {
-                    ffmpeg(outputTmp.name).outputOptions(["-vn", "-c:a libmp3lame", "-b:a 128k", "-y"])
-                        .save(extractedAudioTmp.name)
-                        .on("end", () => { console.log("✅ Original audio extracted."); resolve(); })
-                        .on("error", (err) => { console.error("❌ Audio extraction error:", err); reject(err); });
-                });
-                
-                console.log("📤 Uploading extracted original audio to S3...");
-                const audioBuffer = fs.readFileSync(extractedAudioTmp.name);
-                const audioUploadResult = await uploadToS3(
-                    { buffer: audioBuffer, originalname: `original-sound-${userid}-${Date.now()}.mp3`, mimetype: "audio/mp3" }, `audio`
-                );
-                
-                let originalAudioDuration = 0;
-                const videoDurationMs = (parseFloat(videoEndTime) - parseFloat(videoStartTime));
-                if (!isNaN(videoDurationMs) && videoDurationMs > 0) originalAudioDuration = Math.round(videoDurationMs / 1000);
-
-                console.log("💾 Saving original audio as new Music doc...");
-                const newMusic = new Music({
-                    title: caption ? `${caption.substring(0, 50)}... (Original Sound)` : "Original Video Sound",
-                    artist: name || username || 'Unknown User', url: audioUploadResult,
-                    duration: originalAudioDuration, uploadedBy: user, thumbnail: '',
-                });
-                const savedMusic = await newMusic.save();
-                finalMusicId = savedMusic._id;
-                console.log(`✅ Original audio saved. ID: ${finalMusicId}`);
+                console.log("🔉 Original audio stream found. Deferring extraction to background...");
+                originalAudioToExtract = true;
                 videoHasAudio = true;
             } else {
                 console.log("🔇 No audio stream found in the uploaded video. Skipping audio extraction.");
-                finalMusicId = null; // Silent video hai toh music null set kardo
+                finalMusicId = null;
                 videoHasAudio = false;
             }
         }
@@ -513,7 +435,7 @@ async function processReelUpload(jobData, job = null) {
             savedReel.username = username || savedReel.username; savedReel.name = name || savedReel.name;
             await savedReel.save();
             console.log("✅ Reel stub updated with final metadata.");
-        } 
+        }
 
         try {
             if (uploaderUser && savedReel.shortLinks.length === 0) {
@@ -545,7 +467,7 @@ async function processReelUpload(jobData, job = null) {
 
                 const outputOptions = [
                     "-pix_fmt", "yuv420p", // downsample 10-bit iPhone HDR to standard 8-bit YUV 4:2:0
-                    "-preset", "veryfast",
+                    "-preset", "ultrafast",
                     `-b:v ${variant.videoBitrate}`,
                     `-maxrate ${variant.videoBitrate}`,
                     `-bufsize ${parseInt(variant.videoBitrate) * 2}k`,
@@ -582,17 +504,17 @@ async function processReelUpload(jobData, job = null) {
             const uploadPromises = files.map(file => {
                 const filePath = path.join(variantDir, file);
                 const buffer = fs.readFileSync(filePath);
-                const s3Folder = `videos/reels/${newReelId}/${variant.name}`; 
+                const s3Folder = `videos/reels/${newReelId}/${variant.name}`;
                 const mimetype = file.endsWith(".m3u8") ? "application/vnd.apple.mpegurl" : file.endsWith(".ts") ? "video/mp2t" : "application/octet-stream";
                 return uploadToS3({ buffer, originalname: file, mimetype }, s3Folder, true);
             });
-            while (uploadPromises.length > 0) { 
-                await Promise.all(uploadPromises.splice(0, 12)); 
+            while (uploadPromises.length > 0) {
+                await Promise.all(uploadPromises.splice(0, 12));
             }
             console.log(`✅ Upload complete for ${variant.name}`);
         };
 
-        await generateAndUploadVariant({ name: "480p", resolution: "854x480", videoBitrate: "1100k", audioBitrate: "128k", bandwidth: 1400000, hlsTime: 2 });
+        await generateAndUploadVariant({ name: "480p", resolution: "854x480", videoBitrate: "1100k", audioBitrate: "128k", bandwidth: 1400000, hlsTime: 4 });
 
         console.log("📝 Generating Initial Master Playlist for 480p (m3u8)...");
         const initialMasterPlaylist = `#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-STREAM-INF:BANDWIDTH=1400000,RESOLUTION=854x480\n480p/index.m3u8\n`;
@@ -602,7 +524,7 @@ async function processReelUpload(jobData, job = null) {
 
         // THUMBNAIL LOGIC
         console.log("🖼️ Processing Thumbnail...");
-        let thumbnailUrl = rawThumbnailUrl; 
+        let thumbnailUrl = rawThumbnailUrl;
         if (thumbnailUrl) {
             console.log("📸 Downloading and compressing provided rawThumbnailUrl to WebP...");
             try {
@@ -653,8 +575,8 @@ async function processReelUpload(jobData, job = null) {
             tempFiles.push(thumbTmp);
             await new Promise((resolve, reject) => {
                 ffmpeg(videoFileWithFinalAudioPath).screenshots({ timestamps: [screenshotTime], filename: path.basename(thumbTmp.name), folder: path.dirname(thumbTmp.name) })
-                .on("end", () => { console.log(`✅ Thumbnail frame captured at ${screenshotTime}s.`); resolve(); })
-                .on("error", (err) => { console.error("❌ Thumbnail capture error:", err); reject(err); });
+                    .on("end", () => { console.log(`✅ Thumbnail frame captured at ${screenshotTime}s.`); resolve(); })
+                    .on("error", (err) => { console.error("❌ Thumbnail capture error:", err); reject(err); });
             });
 
             // Convert and compress the generated thumbnail to WebP
@@ -679,17 +601,52 @@ async function processReelUpload(jobData, job = null) {
         const videoUrl = `https://${process.env.CLOUDFRONT_URL}/videos/reels/${newReelId}/master.m3u8`;
         savedReel.videoUrl = sanitizeCdnUrl(videoUrl);
         savedReel.thumbnailUrl = sanitizeCdnUrl(thumbnailUrl);
-        savedReel.status = 'Published'; 
+        savedReel.status = 'Published';
         savedReel.qualityVariants = ["480p"];
         await savedReel.save();
         console.log("===== 🟢 [PRIORITY DONE: REEL IS PUBLISHED & LIVE AT 480P!] =====");
 
-        // 🚀 NON-BLOCKING BACKGROUND ENCODING FOR 720P (HD)
+        console.log("⚙️ Starting background generation of remaining qualities (720p)...");
         (async () => {
             try {
-                console.log("⚙️ Starting background generation of remaining qualities (720p)...");
+                // 🎧 Background Audio Extraction
+                if (originalAudioToExtract) {
+                    console.log("🔉 [BACKGROUND] Original audio stream found. Extracting...");
+                    const extractedAudioTmp = tmp.fileSync({ postfix: ".mp3" });
+                    tempFiles.push(extractedAudioTmp);
+                    await new Promise((resolve, reject) => {
+                        ffmpeg(outputTmp.name).outputOptions(["-vn", "-c:a libmp3lame", "-b:a 128k", "-y"])
+                            .save(extractedAudioTmp.name)
+                            .on("end", () => { console.log("✅ [BACKGROUND] Original audio extracted."); resolve(); })
+                            .on("error", (err) => { console.error("❌ [BACKGROUND] Audio extraction error:", err); reject(err); });
+                    });
+
+                    console.log("📤 [BACKGROUND] Uploading extracted original audio to S3...");
+                    const audioBuffer = fs.readFileSync(extractedAudioTmp.name);
+                    const audioUploadResult = await uploadToS3(
+                        { buffer: audioBuffer, originalname: `original-sound-${userid}-${Date.now()}.mp3`, mimetype: "audio/mp3" }, `audio`
+                    );
+
+                    let originalAudioDuration = 0;
+                    const videoDurationMs = (parseFloat(videoEndTime) - parseFloat(videoStartTime));
+                    if (!isNaN(videoDurationMs) && videoDurationMs > 0) originalAudioDuration = Math.round(videoDurationMs / 1000);
+
+                    console.log("💾 [BACKGROUND] Saving original audio as new Music doc...");
+                    const newMusic = new Music({
+                        title: caption ? `${caption.substring(0, 50)}... (Original Sound)` : "Original Video Sound",
+                        artist: name || username || 'Unknown User', url: audioUploadResult,
+                        duration: originalAudioDuration, uploadedBy: user, thumbnail: thumbnailUrl || '',
+                    });
+                    const savedMusic = await newMusic.save();
+                    finalMusicId = savedMusic._id;
+                    console.log(`✅ [BACKGROUND] Original audio saved. ID: ${finalMusicId}`);
+
+                    // Update Reel with the new music ID reference
+                    await Reel.findByIdAndUpdate(newReelId, { music: finalMusicId });
+                }
+
                 const remainingVariants = [
-                    { name: "720p", resolution: "1280x720", videoBitrate: "2000k", audioBitrate: "160k", bandwidth: 2500000, hlsTime: 2 }
+                    { name: "720p", resolution: "1280x720", videoBitrate: "2000k", audioBitrate: "160k", bandwidth: 2500000, hlsTime: 4 }
                 ];
                 for (const variant of remainingVariants) {
                     await generateAndUploadVariant(variant);
@@ -702,55 +659,61 @@ async function processReelUpload(jobData, job = null) {
 
                 console.log("💾 Updating Reel DB document with all quality variants...");
                 await Reel.findByIdAndUpdate(newReelId, { $addToSet: { qualityVariants: "720p" } });
-                console.log("===== 🎉 [BACKGROUND 720P ENCODING SUCCESSFUL] =====");
+                console.log("===== 🎉 [BACKGROUND: FULL UPLOAD SUCCESS - ALL QUALITIES READY] =====");
 
-                // 🗑️ STORAGE OPTIMIZATION: Delete Raw MP4 from S3 after background processing
-                if (rawVideoUrl) {
-                    const urlObj = new URL(rawVideoUrl);
-                    const rawKey = urlObj.pathname.startsWith('/') ? urlObj.pathname.substring(1) : urlObj.pathname;
-                    console.log(`🧹 Cleaning up S3... Deleting raw file: ${rawKey}`);
-                    
-                    await s3.send(new DeleteObjectCommand({
-                        Bucket: process.env.AWS_BUCKET_NAME,
-                        Key: decodeURIComponent(rawKey),
-                    }));
-                    console.log("✅ Raw MP4 deleted successfully!");
+                // ========================================================
+                // 🗑️ STORAGE OPTIMIZATION: Delete Raw MP4 from S3 after processing
+                // ========================================================
+                try {
+                    if (rawVideoUrl) {
+                        const urlObj = new URL(rawVideoUrl);
+                        const rawKey = urlObj.pathname.startsWith('/') ? urlObj.pathname.substring(1) : urlObj.pathname;
+                        console.log(`🧹 Cleaning up S3 in background... Deleting raw file: ${rawKey}`);
+
+                        await s3.send(new DeleteObjectCommand({
+                            Bucket: process.env.AWS_BUCKET_NAME,
+                            Key: decodeURIComponent(rawKey),
+                        }));
+                        console.log("✅ Raw MP4 deleted successfully! Storage space saved.");
+                    }
+                } catch (deleteError) {
+                    console.error("⚠ Non-blocking Error: Raw MP4 delete nahi ho payi in background:", deleteError.message);
                 }
-            } catch (bgErr) {
-                console.error("⚠️ Background 720p encoding error (non-blocking):", bgErr.message);
+            } catch (bgError) {
+                console.error("❌ Background processing error:", bgError.message || bgError);
             } finally {
                 console.log("🧹 Running background local cleanup for temp files...");
-                tempFiles.forEach((t) => { 
-                    try { if (t) t.removeCallback(); } catch (e) { console.error("Temp file delete err:", e); } 
+                tempFiles.forEach((t) => {
+                    try { if (t) t.removeCallback(); } catch (e) { console.error("Temp file delete err in background:", e); }
                 });
-                if (hlsDir) { 
-                    try { fs.rmSync(hlsDir, { recursive: true, force: true }); } catch (e) { console.error("HLS dir delete err:", e); } 
+                if (hlsDir) {
+                    try { fs.rmSync(hlsDir, { recursive: true, force: true }); } catch (e) { console.error("HLS dir delete err in background:", e); }
                 }
-                console.log("✅ Background cleanup done.");
+                console.log("✅ Background cleanup done.\n");
             }
         })();
 
         return savedReel;
 
     } catch (err) {
-        console.error("\n===== ❌ [WORKER: FULL UPLOAD FATAL ERROR] =====");
-        console.error(err.stack || err.message || err);
-        if (newReelId) {
-            console.log(`⚠️ Updating Reel ${newReelId} status to 'failed' in DB...`);
-            await Reel.findByIdAndUpdate(newReelId, { status: 'failed', error: err.message });
-        }
-        tempFiles.forEach((t) => { 
-            try { if (t) t.removeCallback(); } catch (e) {} 
-        });
-        if (hlsDir) { 
-            try { fs.rmSync(hlsDir, { recursive: true, force: true }); } catch (e) {} 
-        }
-        throw err;
+    console.error("\n===== ❌ [WORKER: FULL UPLOAD FATAL ERROR] =====");
+    console.error(err.stack || err.message || err);
+    if (newReelId) {
+        console.log(`⚠️ Updating Reel ${newReelId} status to 'failed' in DB...`);
+        await Reel.findByIdAndUpdate(newReelId, { status: 'failed', error: err.message });
     }
+    tempFiles.forEach((t) => {
+        try { if (t) t.removeCallback(); } catch (e) { }
+    });
+    if (hlsDir) {
+        try { fs.rmSync(hlsDir, { recursive: true, force: true }); } catch (e) { }
+    }
+    throw err;
+}
 }
 
 // Start BullMQ Worker
-const redisConnection = new IORedis({ maxRetriesPerRequest: null }); 
+const redisConnection = new IORedis({ maxRetriesPerRequest: null });
 
 redisConnection.on('connect', () => console.log("✅ Worker connected to Redis"));
 redisConnection.on('error', (err) => console.error("❌ Redis connection error:", err));

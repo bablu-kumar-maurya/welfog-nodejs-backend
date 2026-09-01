@@ -8,7 +8,7 @@ const logUserAction = require("../utils/logUserAction");
 
 router.post("/block-user", async (req, res) => {
   try {
-    const { blockerId, targetUserId } = req.body; 
+    const { blockerId, targetUserId } = req.body;
 
     if (!blockerId || !targetUserId) {
       return res.status(400).json({ success: false, message: "Both blockerId and targetUserId are required." });
@@ -104,34 +104,32 @@ router.post("/unblock-user", async (req, res) => {
 
 router.get("/blocked-users/:id", async (req, res) => {
   try {
-
     const { id } = req.params;
 
-    // Find user
+    // 🚀 OPTIMIZATION: .lean() and strict .select() to prevent fetching huge extra data
     const user = await User.findById(id)
-      .populate("blockedUsers", "username profilePicture name userid");
+      .select("blockedUsers")
+      .populate({
+        path: "blockedUsers",
+        select: "username profilePicture name userid"
+      })
+      .lean();
 
     if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: "User not found"
-      });
+      return res.status(404).json({ success: false, message: "User not found" });
     }
 
     res.status(200).json({
       success: true,
-      totalBlockedUsers: user.blockedUsers.length,
-      blockedUsers: user.blockedUsers
+      totalBlockedUsers: user.blockedUsers ? user.blockedUsers.length : 0,
+      blockedUsers: user.blockedUsers || []
     });
 
   } catch (error) {
-
     console.error("Blocked Users API Error:", error);
-
-    res.status(500).json({
-      success: false,
-      message: "Server Error"
-    });
+    if (!res.headersSent) {
+      res.status(500).json({ success: false, message: "Server Error" });
+    }
   }
 });
 
@@ -140,7 +138,7 @@ router.post("/mark-interest", async (req, res) => {
   try {
     const { userId, reelId, action } = req.body;
 
-   
+
     if (!userId || !reelId || !action) {
       return res.status(400).json({ message: "userId, reelId, aur action required hain." });
     }
@@ -149,11 +147,11 @@ router.post("/mark-interest", async (req, res) => {
       return res.status(400).json({ message: "Invalid action. Use 'interested' or 'not_interested'." });
     }
 
-  
+
     const interaction = await ReelInteraction.findOneAndUpdate(
-      { user: userId, reel: reelId }, 
-      { action: action },             
-      { upsert: true, new: true }     
+      { user: userId, reel: reelId },
+      { action: action },
+      { upsert: true, new: true }
     );
 
     // Optional: Log analytics

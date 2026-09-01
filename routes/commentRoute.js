@@ -9,71 +9,43 @@ const checkPermission = require("../middleware/checkPermission");
 const logUserAction = require("../utils/logUserAction");
 const logError = require("../utils/logError");
 
+const mongoose = require("mongoose");
+
 router.post("/new", async (req, res) => {
   try {
-    console.log("🔥 NEW COMMENT API HIT");
     const { user: userId, reel: reelId, text, parentComment: incomingParentId } = req.body;
 
     if (!userId || !reelId || !text) {
-      return res.status(400).json({
-        message: "Missing user, reel, or comment text.",
-      });
+      return res.status(400).json({ message: "Missing required fields." });
     }
 
-    // ✅ Fetch user
-    const user = await User.findById(userId).lean();
+    // 1. Sirf User aur Parent (if any) fetch karo. Reel fetch mat karo abhi.
+    const [user, parentDoc] = await Promise.all([
+      User.findById(userId).select("username profilePicture userid isSuspended").lean(),
+      incomingParentId ? Comment.findById(incomingParentId).select("parentComment").lean() : null
+    ]);
+
     if (!user) return res.status(404).json({ message: "User not found" });
+    if (user.isSuspended) return res.status(200).json({ message: "Comment ignored" });
 
-    if (!user.userid) {
-      return res.status(500).json({ message: "User.userid missing" });
-    }
-
-    if (user.isSuspended) {
-      return res.status(200).json({
-        message: "Comment ignored",
-      });
-    }
-
-    // ✅ Fetch reel
-    const reelData = await Reel2.findById(reelId);
-    if (!reelData) return res.status(404).json({ message: "Reel not found" });
-
-    if (!reelData.userid) {
-      return res.status(500).json({ message: "Reel.userid missing" });
-    }
-
-    // 🔥 FIX: Hierarchical Logic
-    // Agar koi reply aa raha hai, toh check karo ki kya wo kisi reply ka reply hai?
-    // Hum hamesha "Root Parent" (Main Comment) ki ID hi save karenge.
     let finalParentId = null;
-    if (incomingParentId) {
-      const parentDoc = await Comment.findById(incomingParentId);
-      if (parentDoc) {
-        // Agar parentDoc khud ek reply hai (matlab uska apna parentComment hai),
-        // toh hum uske asli "Baap" (Root Comment) ki ID use karenge.
-        finalParentId = parentDoc.parentComment ? parentDoc.parentComment : parentDoc._id;
-      }
+    if (parentDoc) {
+      finalParentId = parentDoc.parentComment ? parentDoc.parentComment : parentDoc._id;
     }
 
-    // ✅ Create comment
-    const comment = new Comment({
-      user: userId,
-      reel: reelId,
-      text,
-      parentComment: finalParentId, // Ab ye hamesha Main Comment ki ID hogi
-    });
+    // 🚀 EXTREME OPTIMIZATION: Database me save hone se pehle hi ID bana lo!
+    const newCommentId = new mongoose.Types.ObjectId();
+    const now = new Date();
 
-    const savedComment = await comment.save();
-
-    // 🔥 Response object manually build karna (Jaisa aapne manga tha)
+    // 🔥 Turant frontend ko bhejne ke liye object bana liya
     const finalComment = {
-      _id: savedComment._id,
-      text: savedComment.text,
-      reel: savedComment.reel,
-      parentComment: savedComment.parentComment,
-      likes: savedComment.likes || [],
-      createdAt: savedComment.createdAt,
-      updatedAt: savedComment.updatedAt,
+      _id: newCommentId,
+      text,
+      reel: reelId,
+      parentComment: finalParentId,
+      likes: [],
+      createdAt: now,
+      updatedAt: now,
       user: {
         _id: user._id,
         username: user.username || "User",
@@ -82,60 +54,72 @@ router.post("/new", async (req, res) => {
       },
     };
 
-    // ✅ Save comment ID in reel
-    reelData.comments.push(savedComment._id);
-    await reelData.save();
+    // 🚀 SEND RESPONSE IN MILLISECONDS! (DB write ka wait kiye bina)
+    res.status(201).json(finalComment);
 
-    // ================= NOTIFICATION =================
-    try {
-      if (!incomingParentId) {
-        // Direct comment on Reel
-        await createNotification({
-          recipientObjectId: reelData.user,
-          senderObjectId: user._id,
-          recipientUserId: reelData.userid,
-          senderUserId: user.userid,
-          type: "comment",
+
+    // ================= BACKGROUND WORK (Server aaram se handle karega) =================
+    // Is async block ka intezaar res.json() nahi karega.
+    (async () => {
+      try {
+        // Reel exist karti hai ya nahi, background me check karo
+        const reelData = await Reel2.findById(reelId).select("userid user").lean();
+        if (!reelData) return; // Agar reel delete ho chuki hai, toh kuch mat karo
+
+        // 1. Comment Save karo
+        const comment = new Comment({
+          _id: newCommentId, // Wahi ID jo frontend ko bheji hai
+          user: userId,
           reel: reelId,
-          comment: savedComment._id,
-          message: `commented on your reel: "${savedComment.text}"`,
+          text,
+          parentComment: finalParentId,
+          createdAt: now,
+          updatedAt: now
         });
-      } else {
-        // Reply Notification - Hum notification usko bhejenge jiske comment par 'Reply' click kiya gaya tha
-        const targetComment = await Comment.findById(incomingParentId).populate("user");
+        await comment.save();
 
-        if (
-          targetComment &&
-          targetComment.user &&
-          targetComment.user._id.toString() !== userId.toString()
-        ) {
+        // 2. Reel me Comment ID Push karo
+        await Reel2.findByIdAndUpdate(reelId, { $push: { comments: newCommentId } });
+
+        // 3. Notification Bhejo
+        if (!incomingParentId) {
+          // Direct Comment
           await createNotification({
-            recipientObjectId: targetComment.user._id,
+            recipientObjectId: reelData.user,
             senderObjectId: user._id,
-            recipientUserId: targetComment.user.userid,
+            recipientUserId: reelData.userid,
             senderUserId: user.userid,
-            type: "comment_reply",
+            type: "comment",
             reel: reelId,
-            comment: savedComment._id,
-            message: `replied to your comment: "${savedComment.text}"`,
+            comment: newCommentId,
+            message: `commented on your reel: "${text}"`,
           });
+        } else if (parentDoc && parentDoc.user && parentDoc.user.toString() !== userId.toString()) {
+          // Reply Notification
+          const targetUser = await User.findById(parentDoc.user).select("userid").lean();
+          if (targetUser) {
+            await createNotification({
+              recipientObjectId: parentDoc.user,
+              senderObjectId: user._id,
+              recipientUserId: targetUser.userid,
+              senderUserId: user.userid,
+              type: "comment_reply",
+              reel: reelId,
+              comment: newCommentId,
+              message: `replied to your comment: "${text}"`,
+            });
+          }
         }
+      } catch (bgError) {
+        console.error("🔥 Background Save Error:", bgError);
       }
-    } catch (err) {
-      console.error("Notification error:", err.message);
-    }
-
-    console.log("FINAL RESPONSE:", finalComment);
-    return res.status(201).json(finalComment);
+    })();
 
   } catch (error) {
-    console.error("Comment creation error:", error);
-    error.statusCode = error.statusCode || 500;
-    // await logError(req, error); // Agar logError function hai toh enable rakhein
-
-    return res.status(500).json({
-      message: "Error occurred in Comment creation",
-    });
+    console.error("API Error:", error);
+    if (!res.headersSent) {
+      return res.status(500).json({ message: "Server Error" });
+    }
   }
 });
 

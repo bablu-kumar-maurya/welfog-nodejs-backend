@@ -604,13 +604,19 @@ router.get("/search_populer", async (req, res) => {
   }
 });
 
+
+
+// ==========================================
+// 1. GET USER PROFILE API
+// ==========================================
+
 router.get("/:id", async (req, res) => {
   try {
     const { id } = req.params;
     const viewerId = req.query.viewerId;
 
-    // 1. Fetch user (Populate waisa hi rakha hai, koi logic cut nahi kiya)
-    const user = await User.findOne({
+    // 🚀 OPTIMIZATION: User profile aur Viewer (agar hai) ko ek sath parallel fetch karo
+    const userPromise = User.findOne({
       userid: id,
       isDeleted: { $ne: true },
     })
@@ -624,20 +630,39 @@ router.get("/:id", async (req, res) => {
         select: "userid username name profilePicture",
         match: { isDeleted: { $ne: true } },
       })
-      .select("-passwordHash");
+      .select("-passwordHash")
+      .lean(); // 🔥 `.lean()` for massive speed boost
+
+    const viewerPromise = (viewerId && mongoose.isValidObjectId(viewerId))
+      ? User.findById(viewerId).select("blockedUsers").lean()
+      : Promise.resolve(null);
+
+    const [user, viewer] = await Promise.all([userPromise, viewerPromise]);
 
     if (!user) return res.status(404).json({ message: "User not found" });
 
     // 2. 🛡️ Block Check Logic (Solid Version)
-    if (viewerId) {
-      const viewer = await User.findById(viewerId).select("blockedUsers");
+    if (viewer) {
+      const targetUserIdStr = user._id.toString();
+      const viewerIdStr = viewerId.toString();
 
-      const hasViewerBlockedTarget = viewer?.blockedUsers?.some(
-        (bid) => bid.toString() === user._id.toString(),
-      );
-      const hasTargetBlockedViewer = user.blockedUsers?.some(
-        (bid) => bid.toString() === viewerId.toString(),
-      );
+      let hasViewerBlockedTarget = false;
+      if (viewer.blockedUsers && viewer.blockedUsers.length > 0) {
+        for (let i = 0; i < viewer.blockedUsers.length; i++) {
+          if (viewer.blockedUsers[i].toString() === targetUserIdStr) {
+            hasViewerBlockedTarget = true; break;
+          }
+        }
+      }
+
+      let hasTargetBlockedViewer = false;
+      if (!hasViewerBlockedTarget && user.blockedUsers && user.blockedUsers.length > 0) {
+        for (let i = 0; i < user.blockedUsers.length; i++) {
+          if (user.blockedUsers[i].toString() === viewerIdStr) {
+            hasTargetBlockedViewer = true; break;
+          }
+        }
+      }
 
       if (hasViewerBlockedTarget || hasTargetBlockedViewer) {
         return res.status(404).json({ message: "User not found" });
@@ -646,6 +671,13 @@ router.get("/:id", async (req, res) => {
 
     // 3. Post count & Response
     const postCount = await Reel.countDocuments({ user: user._id });
+
+    // 🚀 FAST MAP: Fast for loop instead of map for array extraction
+    const followersIds = new Array(user.followers.length);
+    for (let i = 0; i < user.followers.length; i++) followersIds[i] = user.followers[i]._id;
+
+    const followingIds = new Array(user.following.length);
+    for (let i = 0; i < user.following.length; i++) followingIds[i] = user.following[i]._id;
 
     res.json({
       _id: user._id,
@@ -660,15 +692,10 @@ router.get("/:id", async (req, res) => {
       seller_id: user.seller_id,
       userseller_id: user.userseller_id,
 
-      // ⭐ FIX: Second API ki tarah yahan isko wapas IDs ka array bana diya 
-      // taaki tumhara UI ka "Follow/Following" button theek se kaam kare
-      followers: user.followers.map(f => f._id),
-      following: user.following.map(f => f._id),
-
-      // ⭐ NAYA: Populated data ko yahan safe rakh liya hai, in case aage avatar dikhane ho
+      followers: followersIds,
+      following: followingIds,
       followersDetails: user.followers,
       followingDetails: user.following,
-
       followersCount: user.followers.length,
       followingCount: user.following.length,
 
@@ -681,10 +708,14 @@ router.get("/:id", async (req, res) => {
     if (typeof logError === "function") {
       await logError(req, err);
     }
-    res.status(500).json({ message: "Server error" });
+    if (!res.headersSent) res.status(500).json({ message: "Server error" });
   }
 });
-// get user posts with pagination
+
+
+// ==========================================
+// 2. GET USER POSTS WITH PAGINATION API
+// ==========================================
 router.get("/userpost/:id", async (req, res) => {
   try {
     const userId = req.params.id;
@@ -696,82 +727,62 @@ router.get("/userpost/:id", async (req, res) => {
     if (limit < 1 || limit > 50) limit = 10;
     if (skip < 0) skip = 0;
 
-    // 👤 Fetch user
-    const user = await User.findOne({
-      _id: userId,
-      isDeleted: { $ne: true },
-    }).select("-passwordHash");
+    const isValidViewerId = viewerId && mongoose.isValidObjectId(viewerId);
+
+    // 🚀 EXTREME PARALLEL OPTIMIZATION: User, Viewer, aur Interactions teeno ek sath!
+    const [user, viewer, interactions] = await Promise.all([
+      User.findOne({ _id: userId, isDeleted: { $ne: true } }).select("-passwordHash").lean(),
+      isValidViewerId ? User.findById(viewerId).select("blockedUsers").lean() : Promise.resolve(null),
+      isValidViewerId ? ReelInteraction.find({ user: viewerId }).select("action reel").lean() : Promise.resolve([])
+    ]);
+
     if (!user) return res.status(404).json({ message: "User not found" });
 
     // 🔒 BLOCK CHECK
-    if (viewerId) {
-      const viewer = await User.findById(viewerId).select("blockedUsers");
-
-      const hasViewerBlockedTarget = viewer?.blockedUsers?.some(
-        (bid) => bid.toString() === userId,
-      );
-
-      const hasTargetBlockedViewer = user.blockedUsers?.some(
-        (bid) => bid.toString() === viewerId,
-      );
+    if (viewer) {
+      const hasViewerBlockedTarget = viewer.blockedUsers?.some((bid) => bid.toString() === userId);
+      const hasTargetBlockedViewer = user.blockedUsers?.some((bid) => bid.toString() === viewerId);
 
       if (hasViewerBlockedTarget || hasTargetBlockedViewer) {
-        return res.status(404).json({
-          message: "User not found",
-          reels: [],
-          postCount: 0,
-        });
+        return res.status(404).json({ message: "User not found", reels: [], postCount: 0 });
       }
     }
 
     // 🔥 BASE QUERY
     let query = { user: userId };
 
-    // 🔥 INTEREST FILTER LOGIC
-    if (viewerId && mongoose.isValidObjectId(viewerId)) {
-      const interactions = await ReelInteraction.find({
-        user: viewerId,
-      }).lean();
+    // 🔥 INTEREST FILTER LOGIC (Optimized Loop)
+    if (isValidViewerId && interactions.length > 0) {
+      const notInterestedIds = [];
+      const interestedIds = [];
 
-      const notInterestedIds = interactions
-        .filter((i) => i.action === "not_interested")
-        .map((i) => new mongoose.Types.ObjectId(i.reel));
-
-      const interestedIds = interactions
-        .filter((i) => i.action === "interested")
-        .map((i) => new mongoose.Types.ObjectId(i.reel));
-
-      // ❌ Remove not interested reels
-      if (notInterestedIds.length > 0) {
-        query._id = {
-          ...(query._id || {}),
-          $nin: notInterestedIds,
-        };
+      for (let i = 0; i < interactions.length; i++) {
+        if (interactions[i].action === "not_interested") {
+          notInterestedIds.push(interactions[i].reel); // Mongoose now auto casts strings to ObjectIds in queries
+        } else if (interactions[i].action === "interested") {
+          interestedIds.push(interactions[i].reel);
+        }
       }
 
-      // ⭐ OPTIONAL: Only show interested reels (agar chaho toggle laga sakte ho)
-      // Example: ?onlyInterested=true
+      if (notInterestedIds.length > 0) {
+        query._id = { ...(query._id || {}), $nin: notInterestedIds };
+      }
+
       if (req.query.onlyInterested === "true" && interestedIds.length > 0) {
-        query._id = {
-          ...(query._id || {}),
-          $in: interestedIds,
-        };
+        query._id = { ...(query._id || {}), $in: interestedIds };
       }
     }
 
-    // 📊 Count
-    const totalCount = await Reel.countDocuments(query);
-
-    // 🎬 Fetch reels
-    const reels = await Reel.find(query)
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(limit);
+    // 🚀 PARALLEL POST FETCH: Count aur Reels dono ek hi time par mangwao!
+    const [totalCount, reels] = await Promise.all([
+      Reel.countDocuments(query),
+      Reel.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).lean()
+    ]);
 
     const hasMore = skip + reels.length < totalCount;
 
     res.json({
-      user: user.toObject(),
+      user, // .toObject() removed because `.lean()` makes it a plain object naturally (Prevents crashes)
       postCount: totalCount,
       reels,
       hasMore,
@@ -779,8 +790,8 @@ router.get("/userpost/:id", async (req, res) => {
   } catch (err) {
     console.error("Error fetching user reels:", err);
     err.statusCode = err.statusCode || 500;
-    await logError(req, err);
-    res.status(500).json({ message: "Server error" });
+    if (typeof logError === "function") await logError(req, err);
+    if (!res.headersSent) res.status(500).json({ message: "Server error" });
   }
 });
 
@@ -946,103 +957,131 @@ router.get("/userlikedposts/:id", async (req, res) => {
 
 router.get("/userfollowing/:id", async (req, res) => {
   try {
-    let query = { userid: req.params.id, isDeleted: { $ne: true } };
-    if (mongoose.isValidObjectId(req.params.id)) {
+    const { id } = req.params;
+    const viewerId = req.query.viewerId;
+
+    let query = { userid: id, isDeleted: { $ne: true } };
+    if (mongoose.isValidObjectId(id)) {
       query = {
-        $or: [
-          { _id: req.params.id },
-          { userid: req.params.id }
-        ],
+        $or: [{ _id: id }, { userid: id }],
         isDeleted: { $ne: true }
       };
     }
-    const user = await User.findOne(query);
+
+    const isValidViewerId = viewerId && mongoose.isValidObjectId(viewerId);
+
+    // 🚀 OPTIMIZATION 1: Parallel Fetch & Single User Query
+    // User ko ek hi baar me populate ke sath fetch kar liya. (Duplicate cleanUser query removed!)
+    // .lean() ka use kiya jisse .toObject() karne ki zaroorat hi nahi padegi.
+    const [user, viewer] = await Promise.all([
+      User.findOne(query)
+        .populate({
+          path: "followers",
+          select: "userid username name profilePicture",
+          match: { isDeleted: { $ne: true } },
+        })
+        .populate({
+          path: "following",
+          select: "userid username name profilePicture",
+          match: { isDeleted: { $ne: true } },
+        })
+        .lean(),
+      isValidViewerId ? User.findById(viewerId).select("blockedUsers").lean() : Promise.resolve(null)
+    ]);
 
     if (!user) {
       return res.status(404).json({ message: "User not found" });
     }
 
-    const viewerId = req.query.viewerId;
+    // 🚀 OPTIMIZATION 2: Set for Ultra-Fast Lookups
+    // Array.includes() ki jagah Set ka use, jo hazaaron followers ko instantly filter karega
+    const blockedSet = new Set();
 
-    let viewer = null;
-    let blockedList = [];
+    if (viewer) {
+      const viewerIdStr = viewer._id.toString();
+      const targetIdStr = user._id.toString();
 
-    if (viewerId) {
-      viewer = await User.findById(viewerId).select("blockedUsers");
+      // 🔒 FULL BLOCK (Instagram style) Check - Fast Loop
+      let hasViewerBlockedTarget = false;
+      if (viewer.blockedUsers && viewer.blockedUsers.length > 0) {
+        for (let i = 0; i < viewer.blockedUsers.length; i++) {
+          if (viewer.blockedUsers[i].toString() === targetIdStr) {
+            hasViewerBlockedTarget = true;
+            break;
+          }
+        }
+      }
 
-      if (viewer) {
-        // ✅ 1. Users jo Viewer ne block kiye hain
-        const blockedByViewer = viewer.blockedUsers.map((id) => id.toString());
+      let hasTargetBlockedViewer = false;
+      if (!hasViewerBlockedTarget && user.blockedUsers && user.blockedUsers.length > 0) {
+        for (let i = 0; i < user.blockedUsers.length; i++) {
+          if (user.blockedUsers[i].toString() === viewerIdStr) {
+            hasTargetBlockedViewer = true;
+            break;
+          }
+        }
+      }
 
-        // ✅ 2. Users jinhone Viewer ko block kiya hai (Bi-directional Check)
-        const blockedViewerDocs = await User.find({
-          blockedUsers: viewer._id,
-        }).select("_id");
-        const blockedViewerIds = blockedViewerDocs.map((u) => u._id.toString());
+      if (hasViewerBlockedTarget || hasTargetBlockedViewer) {
+        return res.json({
+          ...user,
+          followers: [],
+          following: [],
+          followersCount: 0,
+          followingCount: 0,
+          message: "You cannot view this user's connections",
+        });
+      }
 
-        // Merge dono lists
-        blockedList = [...blockedByViewer, ...blockedViewerIds];
+      // ✅ 1. Users jo Viewer ne block kiye hain, Set me add karo
+      if (viewer.blockedUsers) {
+        for (let i = 0; i < viewer.blockedUsers.length; i++) {
+          blockedSet.add(viewer.blockedUsers[i].toString());
+        }
+      }
+
+      // ✅ 2. Users jinhone Viewer ko block kiya hai (Parallel background jaisa call)
+      const blockedViewerDocs = await User.find({ blockedUsers: viewer._id }).select("_id").lean();
+      for (let i = 0; i < blockedViewerDocs.length; i++) {
+        blockedSet.add(blockedViewerDocs[i]._id.toString());
       }
     }
 
-    // 🔒 FULL BLOCK (Instagram style) - Agar current user aur target ke beech block hai
-    const isBlocked =
-      (viewer &&
-        viewer.blockedUsers.some(
-          (id) => id.toString() === user._id.toString(),
-        )) ||
-      user.blockedUsers.some((id) => id.toString() === viewerId?.toString());
+    // ✅ FIX: Plain JS Object is already available due to .lean()
+    // 🚀 MICRO-OPTIMIZATION: .filter() function hata kar For loop lagaya (Node.js engine me sabse fast hota hai)
+    if (blockedSet.size > 0) {
+      const filteredFollowers = [];
+      for (let i = 0; i < user.followers.length; i++) {
+        if (!blockedSet.has(user.followers[i]._id.toString())) {
+          filteredFollowers.push(user.followers[i]);
+        }
+      }
+      user.followers = filteredFollowers;
 
-    if (isBlocked) {
-      return res.json({
-        ...user.toObject(),
-        followers: [],
-        following: [],
-        message: "You cannot view this user's connections",
-      });
-    }
-
-    // 🔁 FETCH CLEAN USER WITH POPULATE + FILTERS
-    const cleanUser = await User.findById(user._id)
-      .populate({
-        path: "followers",
-        select: "userid username name profilePicture",
-        match: { isDeleted: { $ne: true } },
-      })
-      .populate({
-        path: "following",
-        select: "userid username name profilePicture",
-        match: { isDeleted: { $ne: true } },
-      });
-
-    // ✅ FIX: Mongoose document ko pehle Plain JS Object banao!
-    const response = cleanUser.toObject();
-
-    // ✅ FIX: Ab Plain Object par filtering apply karo
-    if (blockedList.length > 0) {
-      response.followers = response.followers.filter(
-        (f) => !blockedList.includes(f._id.toString()),
-      );
-
-      response.following = response.following.filter(
-        (f) => !blockedList.includes(f._id.toString()),
-      );
+      const filteredFollowing = [];
+      for (let i = 0; i < user.following.length; i++) {
+        if (!blockedSet.has(user.following[i]._id.toString())) {
+          filteredFollowing.push(user.following[i]);
+        }
+      }
+      user.following = filteredFollowing;
     }
 
     // Update Counts
-    response.followersCount = response.followers.length;
-    response.followingCount = response.following.length;
+    user.followersCount = user.followers.length;
+    user.followingCount = user.following.length;
 
-    return res.json(response);
+    return res.json(user);
   } catch (err) {
     console.error("Cleanup error:", err);
-    err.statusCode = err.statusCode || 500;
 
-    if (typeof logError === "function") {
-      await logError(req, err);
+    if (!res.headersSent) {
+      err.statusCode = err.statusCode || 500;
+      if (typeof logError === "function") {
+        await logError(req, err);
+      }
+      res.status(500).json({ message: "Server error" });
     }
-
-    res.status(500).json({ message: "Server error" });
   }
 });
 

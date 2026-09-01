@@ -627,8 +627,7 @@ router.get(
 router.get("/shownew", async (req, res) => {
     try {
         const limit = parseInt(req.query.limit || "2", 10);
-        // Exclude logic as it is
-        const exclude = req.query.exclude?.split(",").filter(Boolean) || [];
+        const excludeStr = req.query.exclude;
         const currentUserId = req.query.userId;
         const direction = req.query.direction || "next";
 
@@ -636,103 +635,135 @@ router.get("/shownew", async (req, res) => {
             return res.status(400).json({ message: "Missing userId" });
         }
 
-        let matchStage = exclude.length
-            ? { _id: { $nin: exclude.map((id) => new mongoose.Types.ObjectId(id)) } }
-            : {};
+        // 🚀 MICRO-OPTIMIZATION 1: Ek hi object me matchStage start karein
+        const matchStage = {
+            isDeleted: { $ne: true },
+            status: { $ne: "Blocked" }
+        };
 
-        matchStage.isDeleted = { $ne: true };
-        matchStage.status = { $ne: "Blocked" };
+        const excludedReelIds = [];
 
-        let viewer = null;
-        if (mongoose.isValidObjectId(currentUserId)) {
-            viewer = await User.findById(currentUserId).select("blockedUsers isDeleted profilePicture").lean();
+        // Exclude Array ko fast process karna aur Crash se bachana
+        if (excludeStr) {
+            const excludeArr = excludeStr.split(",");
+            for (let i = 0; i < excludeArr.length; i++) {
+                const id = excludeArr[i].trim();
+                // 🔥 CRASH PREVENTION: Sirf valid ID hi MongoDB filter me jayegi
+                if (id && mongoose.isValidObjectId(id)) {
+                    excludedReelIds.push(new mongoose.Types.ObjectId(id));
+                }
+            }
         }
-        if (!viewer) {
-            viewer = await User.findOne({ userid: currentUserId }).select("blockedUsers isDeleted profilePicture").lean();
-        }
+
+        // 🚀 MICRO-OPTIMIZATION 2: Smart Viewer Query Builder
+        const isIdValid = mongoose.isValidObjectId(currentUserId);
+        const viewerQuery = isIdValid
+            ? { $or: [{ _id: currentUserId }, { userid: currentUserId }] }
+            : { userid: currentUserId };
+
+        const viewer = await User.findOne(viewerQuery)
+            .select("blockedUsers isDeleted profilePicture _id")
+            .lean();
+
+        let currentUserIdStr = currentUserId.toString();
+        let currentUserProfilePic = "";
 
         if (viewer) {
             if (viewer.isDeleted) {
                 return res.status(403).json({ message: "Your account is deleted. Access denied." });
             }
 
-            const blockedList = viewer.blockedUsers || [];
-            const blockers = await User.find({ blockedUsers: viewer._id }).select("_id").lean();
-            const usersWhoBlockedMe = blockers.map(b => b._id);
+            currentUserIdStr = viewer._id.toString();
+            currentUserProfilePic = viewer.profilePicture || "";
 
-            const allExcludedUsers = [...blockedList, ...usersWhoBlockedMe].map(id => new mongoose.Types.ObjectId(id));
+            // Parallel DB calls
+            const [blockers, notInterestedInteractions] = await Promise.all([
+                User.find({ blockedUsers: viewer._id }).select("_id").lean(),
+                ReelInteraction.find({ user: viewer._id, action: "not_interested" })
+                    .select("reel")
+                    .sort({ createdAt: -1 })
+                    .limit(200)
+                    .lean()
+            ]);
+
+            // 🚀 MICRO-OPTIMIZATION 3: Spread Operator (...) ki jagah Direct Push
+            // (Spread operator bade arrays me RAM zyada khata hai aur slow hota hai)
+            const allExcludedUsers = [];
+            const blockedList = viewer.blockedUsers || [];
+
+            for (let i = 0; i < blockedList.length; i++) {
+                allExcludedUsers.push(blockedList[i]);
+            }
+            for (let i = 0; i < blockers.length; i++) {
+                allExcludedUsers.push(blockers[i]._id);
+            }
 
             if (allExcludedUsers.length > 0) {
                 matchStage.user = { $nin: allExcludedUsers };
             }
 
-            const notInterestedInteractions = await ReelInteraction.find({
-                user: viewer._id,
-                action: "not_interested"
-            })
-                .select("reel")
-                .sort({ createdAt: -1 })
-                .limit(200)
-                .lean();
-
-            if (notInterestedInteractions.length > 0) {
-                const notInterestedReelIds = notInterestedInteractions.map(interaction => interaction.reel);
-                if (matchStage._id && matchStage._id.$nin) {
-                    matchStage._id.$nin.push(...notInterestedReelIds);
-                } else {
-                    matchStage._id = { $nin: notInterestedReelIds };
-                }
+            // Not Interested reels ko seedha excludedReelIds me add kar do
+            for (let i = 0; i < notInterestedInteractions.length; i++) {
+                excludedReelIds.push(notInterestedInteractions[i].reel);
             }
         }
 
-        // 🎬 Sample random reels (Bina $lookup ke)
+        // Agar koi bhi exclude karne wali reel mili hai toh matchStage me add karein
+        if (excludedReelIds.length > 0) {
+            matchStage._id = { $nin: excludedReelIds };
+        }
+
+        // 🎬 Aggregate random reels
         const reels = await Reel.aggregate([
             { $match: matchStage },
             { $sample: { size: limit } }
         ]);
 
-        // 🔥 NAYA FIX: Mongoose Populate (Fast aur Bulletproof) 🔥
-        // Yeh sirf ek query me saare reel owners ka data le aayega bina strict format mismatch ke
+        // 🔥 Populate
         await User.populate(reels, {
             path: "user",
             select: "profilePicture followers seller_id userseller_id"
         });
 
-        // 👤 Fetch current user's profile picture
-        const currentUserProfilePic = viewer?.profilePicture || "";
-        const currentUserIdStr = viewer ? viewer._id.toString() : (currentUserId ? currentUserId.toString() : "");
+        // 🚀 MICRO-OPTIMIZATION 4: Fast FOR Loop ki jagah .map()
+        // Node.js engine basic for-loop ko callback functions (.map, .some) se zyada tez execute karta hai
+        const reelsWithFollow = new Array(reels.length); // Memory pehle hi allocate kar di
 
-        // 🔁 Map Loop
-        const reelsWithFollow = reels.map((reel) => {
-            // Populate hone ke baad `reel.user` ab ek puri object ban chuka hai
+        for (let i = 0; i < reels.length; i++) {
+            const reel = reels[i];
             const owner = (reel.user && reel.user._id) ? reel.user : {};
 
-            // Followers check karo
             let isFollowing = false;
-            if (owner.followers && Array.isArray(owner.followers)) {
-                isFollowing = owner.followers.some(followerId => followerId.toString() === currentUserIdStr);
+            if (owner.followers && owner.followers.length > 0) {
+                for (let j = 0; j < owner.followers.length; j++) {
+                    if (owner.followers[j].toString() === currentUserIdStr) {
+                        isFollowing = true;
+                        break; // Jaise hi follower mil jaye, loop rok do (Fast)
+                    }
+                }
             }
 
-            return {
+            reelsWithFollow[i] = {
                 ...reel,
-                // Frontend ko ID ki aadat hai, toh object hata kar wapas string ID set kar di
                 user: owner._id ? owner._id.toString() : reel.user,
                 isFollowing: isFollowing,
-                currentUserProfilePic,
-                reelUserProfilePic: owner.profilePicture || "", // 👈 Photo ab yahan se 100% milegi
+                currentUserProfilePic: currentUserProfilePic,
+                reelUserProfilePic: owner.profilePicture || "",
                 seller_id: reel.seller_id || owner.seller_id || "",
                 userseller_id: reel.userseller_id || owner.userseller_id || "",
             };
-        });
+        }
 
-        res.json({ reels: reelsWithFollow, direction });
+        return res.json({ reels: reelsWithFollow, direction });
+
     } catch (e) {
         console.error("Error fetching reels:", e);
-        e.statusCode = e.statusCode || 500;
-        res.status(500).json({ message: "Error fetching reels" });
+        if (!res.headersSent) {
+            e.statusCode = e.statusCode || 500;
+            return res.status(500).json({ message: "Error fetching reels" });
+        }
     }
 });
-
 router.post("/view", async (req, res) => {
     try {
         const { reelId, userId } = req.body;

@@ -270,7 +270,7 @@ console.log("✅ All routes mounted.");
 
 app.get("/", (req, res) => {
   res.json({
-    "version": "1.0.22",
+    "version": "1.0.23",
     status: "Server is running successfully! "
   });
 });

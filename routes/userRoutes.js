@@ -428,22 +428,31 @@ router.get("/search_populer", async (req, res) => {
 
     // ✅ CASE 1: Explore Page
     if (!query) {
+      // 🔥 FIX: Find random reel IDs first using $sample
+      const randomReels = await Reel.aggregate([
+        {
+          $match: {
+            status: "Published",
+            // ✅ Hide blocked users reels both side
+            user: { $nin: blockedList },
+            // ✅ Hide not interested reels
+            _id: { $nin: notInterestedReelsList },
+          }
+        },
+        { $sample: { size: videoLimit } }, // Randomizer
+        { $project: { _id: 1 } }
+      ]);
+
+      const randomReelIds = randomReels.map((reel) => reel._id);
+
+      // 🔥 Fetch full data using exact same old format and populate
       const videos = await Reel.find({
-        status: "Published",
-
-        // ✅ Hide blocked users reels both side
-        user: { $nin: blockedList },
-
-        // ✅ Hide not interested reels
-        _id: { $nin: notInterestedReelsList },
+        _id: { $in: randomReelIds }
       })
         .select(
           "userid username name videoUrl thumbnailUrl caption likes views createdAt music",
         )
-        .populate("music", "title artist thumbnail")
-        .sort({ views: -1, createdAt: -1 })
-        .skip(videoSkip)
-        .limit(videoLimit);
+        .populate("music", "title artist thumbnail");
 
       const hasMoreVideos = videos.length === videoLimit;
 
@@ -2209,56 +2218,6 @@ function getCategoryFromAction(action) {
   }
   return "other";
 }
-
-router.post("/external/suspend-user", async (req, res) => {
-  try {
-    const { userId, isSuspended, reason, suspendedBy } = req.body;
-
-    if (!userId) {
-      return res.status(400).json({ message: "userId required" });
-    }
-
-    const user = await User.findOne({ userid: userId });
-    if (!user) return res.status(404).json({ message: "User not found" });
-
-    if (typeof isSuspended === "boolean") {
-      user.isSuspended = isSuspended;
-
-      if (isSuspended) {
-        user.suspendReason = reason || "No reason provided";
-        user.suspendedBy = suspendedBy || "external_admin";
-        user.suspendedAt = new Date();
-      } else {
-        user.suspendReason = "";
-        user.suspendedBy = null;
-        user.suspendedAt = null;
-      }
-    }
-
-    await user.save();
-
-    // 🔥 log bhi kar
-    await logUserAction({
-      user: suspendedBy || "external",
-      action: isSuspended ? "account_suspended" : "account_reactivated",
-      targetType: "User",
-      targetId: user._id,
-      targetName: user.username,
-      metadata: {
-        reason: reason || "",
-        source: "shopping_app",
-      },
-    });
-
-    res.json({
-      success: true,
-      message: `User ${isSuspended ? "suspended" : "activated"} successfully`,
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: "Server error" });
-  }
-});
 
 router.put("/action/disconnect-seller", async (req, res) => {
   try {

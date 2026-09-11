@@ -10,58 +10,116 @@ const logUserAction = require("../utils/logUserAction");
 const logError = require("../utils/logError");
 const Reel = require("../models/Reel");
 
+// router.get("/search", async (req, res) => {
+//   const { q } = req.query;
+//   if (!q) return res.json([]);
+
+//   try {
+//     // 1️⃣ Search local DB
+//     const localResults = await Music.find({
+//       title: { $regex: q, $options: "i" },
+//     }).lean();
+
+//     // 2️⃣ Fetch from Audius API
+//     const searchUrl = `https://discoveryprovider.audius.co/v1/tracks/search?query=${encodeURIComponent(
+//       q
+//     )}&app_name=welfog`;
+//     const searchRes = await axios.get(searchUrl);
+
+//     const audiusTracks = searchRes.data.data.map((track) => ({
+//       id: track.id,
+//       title: track.title,
+//       artist: track.user?.name,
+//       artwork: track.artwork?.["480x480"] || track.artwork?.["150x150"],
+//       url: `https://discoveryprovider.audius.co/v1/tracks/${track.id}/stream?app_name=welfog`,
+//     }));
+
+//     // 3️⃣ Filter out duplicates (already in local DB)
+//     const existingTitles = localResults.map((t) => t.title?.toLowerCase().trim());
+//     const newAudiusTracks = audiusTracks.filter(
+//       (t) => !existingTitles.includes(t.title?.toLowerCase().trim())
+//     );
+
+
+//     // 5️⃣ Combine both — local first, then Audius
+//     const combinedResults = [
+//       ...localResults.map((r) => ({
+//         id: r.audiusId || r._id,
+//         title: r.title,
+//         artist: r.artist,
+//         artwork: r.artwork,
+//         url: r.url,
+//       })),
+//       ...newAudiusTracks,
+//     ];
+
+//     res.json(combinedResults);
+//   } catch (err) {
+//     console.error("❌ Error fetching tracks:", err.message);
+//     err.statusCode = err.statusCode || 500;
+//     await logError(req, err);
+//     res.status(500).json({ error: "Failed to fetch music" });
+//   }
+// });
+
+
+
 router.get("/search", async (req, res) => {
   const { q } = req.query;
+
   if (!q) return res.json([]);
 
   try {
-    // 1️⃣ Search local DB
+    // 1️⃣ Search local DB first
     const localResults = await Music.find({
       title: { $regex: q, $options: "i" },
     }).lean();
 
-    // 2️⃣ Fetch from Audius API
+    // 2️⃣ DB me music mil gaya → wahi return karo
+    if (localResults.length > 0) {
+      return res.json(
+        localResults.map((r) => ({
+          id: r.audiusId || r._id,
+          title: r.title,
+          artist: r.artist,
+          artwork: r.artwork,
+          url: r.url,
+        }))
+      );
+    }
+
+    // 3️⃣ DB me music nahi mila → Audius API se search karo
     const searchUrl = `https://discoveryprovider.audius.co/v1/tracks/search?query=${encodeURIComponent(
       q
     )}&app_name=welfog`;
+
     const searchRes = await axios.get(searchUrl);
 
     const audiusTracks = searchRes.data.data.map((track) => ({
       id: track.id,
       title: track.title,
       artist: track.user?.name,
-      artwork: track.artwork?.["480x480"] || track.artwork?.["150x150"],
+      artwork:
+        track.artwork?.["480x480"] ||
+        track.artwork?.["150x150"],
       url: `https://discoveryprovider.audius.co/v1/tracks/${track.id}/stream?app_name=welfog`,
     }));
 
-    // 3️⃣ Filter out duplicates (already in local DB)
-    const existingTitles = localResults.map((t) => t.title?.toLowerCase().trim());
-    const newAudiusTracks = audiusTracks.filter(
-      (t) => !existingTitles.includes(t.title?.toLowerCase().trim())
-    );
+    // 4️⃣ Return Audius results
+    return res.json(audiusTracks);
 
-
-    // 5️⃣ Combine both — local first, then Audius
-    const combinedResults = [
-      ...localResults.map((r) => ({
-        id: r.audiusId || r._id,
-        title: r.title,
-        artist: r.artist,
-        artwork: r.artwork,
-        url: r.url,
-      })),
-      ...newAudiusTracks,
-    ];
-
-    res.json(combinedResults);
   } catch (err) {
     console.error("❌ Error fetching tracks:", err.message);
+
     err.statusCode = err.statusCode || 500;
+
     await logError(req, err);
-    res.status(500).json({ error: "Failed to fetch music" });
+
+    return res.status(500).json({
+      error: "Failed to fetch music",
+    });
   }
 });
-
 
 router.get("/searchindb", async (req, res) => {
   try {

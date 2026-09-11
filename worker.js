@@ -6,7 +6,7 @@ const http = require("http");
 const https = require("https");
 const os = require("os");
 const ffmpeg = require("fluent-ffmpeg");
-const ffmpegInstaller = require("@ffmpeg-installer/ffmpeg");
+const ffmpegStatic = require("ffmpeg-static");
 const ffprobeStatic = require('ffprobe-static');
 const { Worker } = require('bullmq');
 const IORedis = require('ioredis');
@@ -28,9 +28,9 @@ mongoose.connect(process.env.MONGO_URI)
     .then(() => console.log("✅ Worker connected to MongoDB"))
     .catch(err => console.error("❌ Worker DB Connection Error:", err));
 
-ffmpeg.setFfmpegPath(ffmpegInstaller.path);
+ffmpeg.setFfmpegPath(ffmpegStatic);
 ffmpeg.setFfprobePath(ffprobeStatic.path);
-console.log("🎬 FFmpeg paths configured successfully.");
+console.log("🎬 FFmpeg paths configured successfully (using ffmpeg-static v6).");
 
 // =================================================================
 // === FFMPEG & DOWNLOAD HELPERS ===
@@ -55,10 +55,13 @@ async function compressVideo(inputPath, outputPath) {
     if (width < 1280) { scaleFilter = "scale=540:-2"; }
 
     return new Promise((resolve, reject) => {
-        ffmpeg(inputPath).videoFilters(scaleFilter).outputOptions([
-            "-c:v libx264", `-b:v ${bps}k`, `-maxrate ${bps}k`, `-bufsize ${bps * 2}k`, `-crf ${crf}`,
-            "-preset veryfast", "-c:a aac", "-b:a 128k", "-movflags +faststart", "-y"
-        ]).save(outputPath)
+        ffmpeg(inputPath)
+            .videoFilters([`${scaleFilter}`, "format=yuv420p"])
+            .outputOptions([
+                "-c:v libx264", `-b:v ${bps}k`, `-maxrate ${bps}k`, `-bufsize ${bps * 2}k`, `-crf ${crf}`,
+                "-preset veryfast", "-pix_fmt yuv420p", "-color_primaries bt709", "-color_trc bt709", "-colorspace bt709",
+                "-c:a aac", "-b:a 128k", "-movflags +faststart", "-y"
+            ]).save(outputPath)
             .on("end", () => { console.log("✅ [compressVideo] Completed!"); resolve(); })
             .on("error", (err) => { console.error("❌ [compressVideo] Error:", err); reject(err); });
     });
@@ -453,24 +456,56 @@ async function processReelUpload(jobData, job = null) {
         hlsDir = path.join(os.tmpdir(), `hls-${newReelId}`);
         fs.mkdirSync(hlsDir, { recursive: true });
 
+        // Probe video to determine orientation (portrait vs landscape)
+        let isPortrait = true;
+        try {
+            const probeData = await new Promise((resolve, reject) => {
+                ffmpeg.ffprobe(videoFileWithFinalAudioPath, (err, data) => {
+                    if (err) return reject(err);
+                    resolve(data);
+                });
+            });
+            const vStream = probeData?.streams?.find(s => s.codec_type === 'video');
+            if (vStream) {
+                const w = vStream.width || 720;
+                const h = vStream.height || 1280;
+                const rotation = vStream.tags?.rotate || vStream.side_data_list?.find(sd => sd.rotation)?.rotation;
+                if (rotation === '90' || rotation === '270' || rotation === 90 || rotation === 270) {
+                    isPortrait = w >= h;
+                } else {
+                    isPortrait = h >= w;
+                }
+            }
+        } catch (probeErr) {
+            console.warn("⚠️ Probe failed, defaulting to portrait orientation:", probeErr.message);
+        }
+        console.log(`📐 Video orientation detected: ${isPortrait ? "PORTRAIT (Vertical Reel)" : "LANDSCAPE"}`);
+
         const generateAndUploadVariant = async (variant) => {
-            console.log(`🎬 Generating HLS variant: ${variant.name} (${variant.resolution})...`);
+            console.log(`🎬 Generating HLS variant: ${variant.name}...`);
             const variantDir = path.join(hlsDir, variant.name);
             fs.mkdirSync(variantDir, { recursive: true });
             const segmentPattern = path.join(variantDir, "segment_%03d.ts").replace(/\\/g, '/');
             const outputPath = path.join(variantDir, "index.m3u8").replace(/\\/g, '/');
 
+            const targetScale = isPortrait ? variant.portraitScale : variant.landscapeScale;
+
             await new Promise((resolve, reject) => {
                 const cmd = ffmpeg(videoFileWithFinalAudioPath)
-                    .videoFilters(`scale=${variant.resolution}:force_original_aspect_ratio=decrease,pad=ceil(iw/2)*2:ceil(ih/2)*2`)
+                    .videoFilters(`${targetScale},pad=ceil(iw/2)*2:ceil(ih/2)*2,format=yuv420p`)
                     .videoCodec('libx264');
 
                 const outputOptions = [
                     "-pix_fmt", "yuv420p", // downsample 10-bit iPhone HDR to standard 8-bit YUV 4:2:0
+                    "-color_primaries", "bt709",
+                    "-color_trc", "bt709",
+                    "-colorspace", "bt709",
+                    "-profile:v", "main",
+                    "-level", "4.0",
                     "-preset", "ultrafast",
-                    `-b:v ${variant.videoBitrate}`,
-                    `-maxrate ${variant.videoBitrate}`,
-                    `-bufsize ${parseInt(variant.videoBitrate) * 2}k`,
+                    `-b:v`, `${variant.videoBitrate}`,
+                    `-maxrate`, `${variant.videoBitrate}`,
+                    `-bufsize`, `${parseInt(variant.videoBitrate) * 2}k`,
                     "-sc_threshold", "0",
                     "-g", `${24 * variant.hlsTime}`,
                     "-keyint_min", `${24 * variant.hlsTime}`,
@@ -487,7 +522,7 @@ async function processReelUpload(jobData, job = null) {
 
                 if (videoHasAudio) {
                     cmd.audioCodec('aac');
-                    outputOptions.push(`-b:a ${variant.audioBitrate}`);
+                    outputOptions.push(`-b:a`, `${variant.audioBitrate}`);
                 } else {
                     cmd.noAudio();
                 }
@@ -514,10 +549,21 @@ async function processReelUpload(jobData, job = null) {
             console.log(`✅ Upload complete for ${variant.name}`);
         };
 
-        await generateAndUploadVariant({ name: "480p", resolution: "854x480", videoBitrate: "1100k", audioBitrate: "128k", bandwidth: 1400000, hlsTime: 4 });
+        const variant480p = {
+            name: "480p",
+            portraitScale: "scale=480:854:force_original_aspect_ratio=decrease",
+            landscapeScale: "scale=854:480:force_original_aspect_ratio=decrease",
+            resString: isPortrait ? "480x854" : "854x480",
+            videoBitrate: "1100k",
+            audioBitrate: "128k",
+            bandwidth: 1400000,
+            hlsTime: 4
+        };
+
+        await generateAndUploadVariant(variant480p);
 
         console.log("📝 Generating Initial Master Playlist for 480p (m3u8)...");
-        const initialMasterPlaylist = `#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-STREAM-INF:BANDWIDTH=1400000,RESOLUTION=854x480\n480p/index.m3u8\n`;
+        const initialMasterPlaylist = `#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-STREAM-INF:BANDWIDTH=1400000,RESOLUTION=${variant480p.resString}\n480p/index.m3u8\n`;
         fs.writeFileSync(path.join(hlsDir, "master.m3u8"), initialMasterPlaylist);
         console.log("📤 Uploading Initial Master Playlist (480p) to S3...");
         await uploadToS3({ buffer: fs.readFileSync(path.join(hlsDir, "master.m3u8")), originalname: "master.m3u8", mimetype: "application/vnd.apple.mpegurl" }, `videos/reels/${newReelId}`, true);
@@ -645,15 +691,20 @@ async function processReelUpload(jobData, job = null) {
                     await Reel.findByIdAndUpdate(newReelId, { music: finalMusicId });
                 }
 
-                const remainingVariants = [
-                    { name: "720p", resolution: "1280x720", videoBitrate: "2000k", audioBitrate: "160k", bandwidth: 2500000, hlsTime: 4 }
-                ];
-                for (const variant of remainingVariants) {
-                    await generateAndUploadVariant(variant);
-                }
+                const variant720p = {
+                    name: "720p",
+                    portraitScale: "scale=720:1280:force_original_aspect_ratio=decrease",
+                    landscapeScale: "scale=1280:720:force_original_aspect_ratio=decrease",
+                    resString: isPortrait ? "720x1280" : "1280x720",
+                    videoBitrate: "2000k",
+                    audioBitrate: "160k",
+                    bandwidth: 2500000,
+                    hlsTime: 4
+                };
+                await generateAndUploadVariant(variant720p);
 
                 console.log("📝 Updating Master Playlist on S3 to include 720p (HD)...");
-                const updatedMasterPlaylist = `#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-STREAM-INF:BANDWIDTH=1400000,RESOLUTION=854x480\n480p/index.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720\n720p/index.m3u8\n`;
+                const updatedMasterPlaylist = `#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-STREAM-INF:BANDWIDTH=1400000,RESOLUTION=${variant480p.resString}\n480p/index.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=${variant720p.resString}\n720p/index.m3u8\n`;
                 fs.writeFileSync(path.join(hlsDir, "master.m3u8"), updatedMasterPlaylist);
                 await uploadToS3({ buffer: fs.readFileSync(path.join(hlsDir, "master.m3u8")), originalname: "master.m3u8", mimetype: "application/vnd.apple.mpegurl" }, `videos/reels/${newReelId}`, true);
 

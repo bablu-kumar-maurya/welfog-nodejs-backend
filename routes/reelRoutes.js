@@ -221,6 +221,8 @@ router.post("/full-upload", async (req, res) => {
                 _id: savedStub._id,
                 status: savedStub.status,
                 caption: savedStub.caption,
+                captionTime: savedStub.captionTime,
+                captionUpdatedAt: savedStub.captionUpdatedAt,
                 thumbnailUrl: savedStub.thumbnailUrl,
                 qualityVariants: savedStub.qualityVariants || [],
             },
@@ -850,8 +852,29 @@ router.get("/current/:id", async (req, res) => {
             return res.status(400).json({ message: "Invalid reel ID" });
         }
 
-        // 2️⃣ Fetch reel
-        const currentReel = await Reel.findById(id).lean();
+        // 🚀 EXTREME OPTIMIZATION: PARALLEL QUERIES FROM LINE 1
+        // Hum Reel (owner data ke sath) aur Viewer DONO ko ek hi millisecond me fetch karenge!
+
+        let viewerPromise = Promise.resolve(null);
+        if (currentUserId) {
+            const isIdValid = mongoose.isValidObjectId(currentUserId);
+            // 2 alag queries likhne ki jagah $or use karke DB calls 1 kar di
+            const viewerQuery = isIdValid
+                ? { $or: [{ _id: currentUserId }, { userid: currentUserId }] }
+                : { userid: currentUserId };
+
+            viewerPromise = User.findOne(viewerQuery).select("blockedUsers profilePicture _id").lean();
+        }
+
+        // Reel fetch karte time hi Owner(user) ko populate kar lo (2nd DB trip bach gayi)
+        const reelPromise = Reel.findById(id).populate({
+            path: 'user',
+            select: 'blockedUsers profilePicture followers _id'
+        }).lean();
+
+        // ⏳ Execute BOTH database queries at the exact same time!
+        const [viewer, currentReel] = await Promise.all([viewerPromise, reelPromise]);
+
         if (!currentReel) {
             return res.status(404).json({ message: "Reel not found!" });
         }
@@ -861,65 +884,80 @@ router.get("/current/:id", async (req, res) => {
             return res.status(404).json({ message: "Reel not available" });
         }
 
-        // Resolve viewer to support string userid fallback
-        let viewer = null;
-        if (currentUserId) {
-            if (mongoose.isValidObjectId(currentUserId)) {
-                viewer = await User.findById(currentUserId).select("blockedUsers profilePicture").lean();
+        // Populate ki wajah se currentReel.user ek object ban gaya hai, usko nikal lo
+        const owner = currentReel.user || {};
+        const ownerIdStr = owner._id ? owner._id.toString() : currentReel.user.toString();
+
+        // 🔥 4️⃣ MUTUAL BLOCK CHECK (Micro-optimized with For-Loops) 🔥
+        if (viewer && owner._id) {
+            const viewerIdStr = viewer._id.toString();
+            let hasBlocked = false;
+
+            // Check if Viewer blocked Owner (Fast Loop)
+            if (viewer.blockedUsers && viewer.blockedUsers.length > 0) {
+                for (let i = 0; i < viewer.blockedUsers.length; i++) {
+                    if (viewer.blockedUsers[i].toString() === ownerIdStr) {
+                        hasBlocked = true;
+                        break; // condition milte hi ruk jao (time saver)
+                    }
+                }
             }
-            if (!viewer) {
-                viewer = await User.findOne({ userid: currentUserId }).select("blockedUsers profilePicture").lean();
+
+            // Check if Owner blocked Viewer (Fast Loop)
+            if (!hasBlocked && owner.blockedUsers && owner.blockedUsers.length > 0) {
+                for (let i = 0; i < owner.blockedUsers.length; i++) {
+                    if (owner.blockedUsers[i].toString() === viewerIdStr) {
+                        hasBlocked = true;
+                        break;
+                    }
+                }
+            }
+
+            if (hasBlocked) {
+                return res.status(404).json({ message: "Reel not available" });
             }
         }
 
-        // 🔥 ADDED: MUTUAL BLOCK CHECK START 🔥
-        if (viewer && currentReel.user) {
-            const owner = await User.findById(currentReel.user).select("blockedUsers").lean();
+        // 5️⃣ Fetch profile pictures
+        const currentUserProfilePic = viewer?.profilePicture || "";
+        const reelUserProfilePic = owner?.profilePicture || "";
 
-            if (owner) {
-                const hasViewerBlockedOwner = viewer.blockedUsers?.some(bid => bid.toString() === currentReel.user.toString());
-                const hasOwnerBlockedViewer = owner.blockedUsers?.some(bid => bid.toString() === viewer._id.toString());
+        // 6️⃣ Check follow status (Micro-optimized)
+        const currentUserIdStr = viewer ? viewer._id.toString() : (currentUserId ? currentUserId.toString() : "");
+        let isFollowing = false;
 
-                if (hasViewerBlockedOwner || hasOwnerBlockedViewer) {
-                    return res.status(404).json({ message: "Reel not available" });
+        if (currentUserIdStr && owner.followers && owner.followers.length > 0) {
+            for (let i = 0; i < owner.followers.length; i++) {
+                if (owner.followers[i].toString() === currentUserIdStr) {
+                    isFollowing = true;
+                    break;
                 }
             }
         }
-        // 🔥 ADDED: MUTUAL BLOCK CHECK END 🔥
 
-        // 4️⃣ Fetch current user's profile picture
-        const currentUserProfilePic = viewer?.profilePicture || "";
-
-        // 5️⃣ Fetch reel owner info
-        const reelOwner = await User.findById(
-            currentReel.user,
-            "profilePicture followers"
-        ).lean();
-
-        const reelUserProfilePic = reelOwner?.profilePicture || "";
-
-        // 6️⃣ Check follow status
-        const currentUserIdStr = viewer ? viewer._id.toString() : (currentUserId ? currentUserId.toString() : "");
-        const isFollowing = reelOwner?.followers?.some(
-            (followerId) => followerId.toString() === currentUserIdStr
-        );
+        // 🛠️ FIX FOR FRONTEND: Frontend ko 'user' field me ID chahiye object nahi, isliye usko wapas set kar diya
+        currentReel.user = ownerIdStr;
 
         // 7️⃣ Final response object
         const reelWithProfiles = {
             ...currentReel,
             reelUserProfilePic,
             currentUserProfilePic,
-            isFollowing: !!isFollowing,
+            isFollowing,
         };
 
         // 8️⃣ Send response
-        res.status(200).json(reelWithProfiles);
+        return res.status(200).json(reelWithProfiles);
 
     } catch (error) {
         console.error("Error in /current/:id →", error);
-        error.statusCode = error.statusCode || 500;
-        await logError(req, error);
-        res.status(500).json({ message: "Server error" });
+        if (!res.headersSent) {
+            error.statusCode = error.statusCode || 500;
+            if (typeof logError === "function") {
+                await logError(req, error);
+            }
+            return res.status(500).json({ message: "Server error" });
+        }
     }
 });
 
@@ -1000,190 +1038,155 @@ router.get("/others/:userId", async (req, res) => {
             playableOnly,
         } = req.query;
 
-        const onlyPlayable =
-            playableOnly === "1" ||
-            playableOnly === "true" ||
-            playableOnly === true;
-
+        const onlyPlayable = playableOnly === "1" || playableOnly === "true" || playableOnly === true;
         let query = {};
 
-        // 🔥 BLOCKED REELS HIDE (USER SIDE)
+        // 🔥 BLOCKED REELS HIDE
         query.status = onlyPlayable ? "Published" : { $ne: "Blocked" };
 
         if (onlyPlayable) {
             query.videoUrl = { $exists: true, $nin: ["", null] };
-            // 480p goes live first; 720p is added in the background.
             query.qualityVariants = { $in: ["480p", "720p"] };
         }
 
-        let resolvedTargetUserId = null;
-        if (reelType !== "liked" && reelType !== "music") {
-            let cleanUserId = userId || "";
-            if (cleanUserId.startsWith("@")) {
-                cleanUserId = cleanUserId.substring(1);
-            }
+        // 🚀 OPTIMIZATION 1: Target User aur Viewer ko PARALLEL me fetch karo
+        const isProfileReels = reelType !== "liked" && reelType !== "music";
 
-            let targetUser = null;
-            if (mongoose.isValidObjectId(cleanUserId)) {
-                targetUser = await User.findById(cleanUserId).lean();
+        let targetUserPromise = Promise.resolve(null);
+        if (isProfileReels) {
+            // 6 alag-alag DB calls ki jagah ek hi smart $or query!
+            let cleanUserId = userId ? (userId.startsWith("@") ? userId.substring(1) : userId) : "";
+            const userConditions = [{ userid: cleanUserId }, { username: cleanUserId }];
+            if (userId !== cleanUserId) {
+                userConditions.push({ userid: userId }, { username: userId });
             }
-            if (!targetUser && mongoose.isValidObjectId(userId)) {
-                targetUser = await User.findById(userId).lean();
-            }
-            if (!targetUser) {
-                targetUser = await User.findOne({ userid: cleanUserId }).lean();
-            }
-            if (!targetUser) {
-                targetUser = await User.findOne({ userid: userId }).lean();
-            }
-            if (!targetUser) {
-                targetUser = await User.findOne({ username: cleanUserId }).lean();
-            }
-            if (!targetUser) {
-                targetUser = await User.findOne({ username: userId }).lean();
-            }
-            if (!targetUser) {
-                return res.status(200).json([]);
-            }
-            resolvedTargetUserId = targetUser._id;
+            if (mongoose.isValidObjectId(cleanUserId)) userConditions.push({ _id: cleanUserId });
+            if (mongoose.isValidObjectId(userId)) userConditions.push({ _id: userId });
+
+            targetUserPromise = User.findOne({ $or: userConditions }).select("_id").lean();
+        }
+
+        let viewerPromise = Promise.resolve(null);
+        if (currentUserId) {
+            const viewerConditions = [{ userid: currentUserId }];
+            if (mongoose.isValidObjectId(currentUserId)) viewerConditions.push({ _id: currentUserId });
+            viewerPromise = User.findOne({ $or: viewerConditions }).select("blockedUsers profilePicture _id").lean();
+        }
+
+        // Ek sath fetch karo
+        const [targetUser, viewer] = await Promise.all([targetUserPromise, viewerPromise]);
+
+        if (isProfileReels && !targetUser) {
+            return res.status(200).json([]);
         }
 
         // 🎯 Decide which reels to fetch
         if (reelType === "liked") {
-            if (!currentUserId) {
-                return res.status(400).json({
-                    message: "currentUserId is required for liked reels"
-                });
-            }
+            if (!currentUserId) return res.status(400).json({ message: "currentUserId is required for liked reels" });
             query.likes = currentUserId;
-
         } else if (reelType === "music") {
-            if (!musicId) {
-                return res.status(400).json({
-                    message: "musicId is required for music reels"
-                });
-            }
+            if (!musicId) return res.status(400).json({ message: "musicId is required for music reels" });
             query.music = musicId;
-
         } else {
-            query.user = resolvedTargetUserId;
+            query.user = targetUser._id;
         }
 
-        // Resolve currentUserId / viewer to handle string userid
-        let viewer = null;
-        if (currentUserId) {
-            if (mongoose.isValidObjectId(currentUserId)) {
-                viewer = await User.findById(currentUserId).select("blockedUsers profilePicture").lean();
-            }
-            if (!viewer) {
-                viewer = await User.findOne({ userid: currentUserId }).select("blockedUsers profilePicture").lean();
-            }
+        const excludeIdsArray = []; // $nin me dalne ke liye combined array
+
+        if (excludeId && mongoose.isValidObjectId(excludeId)) {
+            excludeIdsArray.push(new mongoose.Types.ObjectId(excludeId));
         }
 
-        // 🔥 ADDED: MUTUAL BLOCK FILTER LOGIC START 🔥
+        // 🚀 OPTIMIZATION 2: Parallel Blockers & Interactions Fetch
         if (viewer) {
-            const blockedList = viewer.blockedUsers || [];
-            const blockers = await User.find({ blockedUsers: viewer._id }).select("_id").lean();
-            const usersWhoBlockedMe = blockers.map(b => b._id);
-            const allBlocked = [...blockedList, ...usersWhoBlockedMe];
+            const [blockers, notInterested] = await Promise.all([
+                User.find({ blockedUsers: viewer._id }).select("_id").lean(),
+                ReelInteraction.find({ user: viewer._id, action: "not_interested" }).select("reel").lean()
+            ]);
+
+            // Mutual Block Logic with Set (O(1) Ultra-Fast Lookup)
+            const blockedSet = new Set();
+            if (viewer.blockedUsers) {
+                for (let i = 0; i < viewer.blockedUsers.length; i++) blockedSet.add(viewer.blockedUsers[i].toString());
+            }
+            for (let i = 0; i < blockers.length; i++) blockedSet.add(blockers[i]._id.toString());
+
+            const allBlocked = Array.from(blockedSet);
 
             if (allBlocked.length > 0) {
                 if (query.user) {
-                    // Agar specific profile dekh rahe hain, aur wo block hai, toh seedha empty return
-                    const isBlocked = allBlocked.some(bid => bid.toString() === query.user.toString());
-                    if (isBlocked) {
-                        return res.status(200).json([]);
+                    if (blockedSet.has(query.user.toString())) {
+                        return res.status(200).json([]); // specific profile blocked hai
                     }
                 } else {
-                    // Agar Liked ya Music reels dekh rahe hain, toh blocked owners ki reels nikal do
                     query.user = { $nin: allBlocked };
                 }
             }
-        }
-        // 🔥 ADDED: MUTUAL BLOCK FILTER LOGIC END 🔥
 
-        if (viewer) {
-            const notInterested = await ReelInteraction.find({
-                user: viewer._id,
-                action: "not_interested"
-            }).select("reel").lean();
-
-            if (notInterested.length > 0) {
-                const notInterestedIds = notInterested.map(
-                    i => new mongoose.Types.ObjectId(i.reel)
-                );
-
-                if (query._id) {
-                    query._id = {
-                        ...query._id,
-                        $nin: [...(query._id.$nin || []), ...notInterestedIds]
-                    };
-                } else {
-                    query._id = { $nin: notInterestedIds };
-                }
+            // Not interested interactions push to exclude array
+            for (let i = 0; i < notInterested.length; i++) {
+                excludeIdsArray.push(new mongoose.Types.ObjectId(notInterested[i].reel));
             }
         }
 
-        // 🚫 Exclude a reel (for infinite scroll) — FIXED
-        if (excludeId) {
-            const excludeObjectId = new mongoose.Types.ObjectId(excludeId);
-
-            if (query._id) {
-                query._id = {
-                    ...query._id,
-                    $ne: excludeObjectId
-                };
-            } else {
-                query._id = { $ne: excludeObjectId };
-            }
+        // Apply Excluded IDs & Not Interested IDs in one single operation
+        if (excludeIdsArray.length > 0) {
+            query._id = { $nin: excludeIdsArray };
         }
 
-        // 📦 Fetch reels
+        // 🚀 OPTIMIZATION 3: N+1 Query Fix 
+        // Populate ka use karo, har reel ke liye loop me alag se DB call lagane ki zarurat nahi!
         const reels = await Reel.find(query)
             .sort({ createdAt: -1 })
             .skip(parseInt(skip))
             .limit(parseInt(limit))
+            .populate({ path: "user", select: "profilePicture followers _id" }) // 🔥 Single fetch for all owners
             .lean();
 
         if (!reels.length) {
             return res.status(200).json([]);
         }
 
-        // 👤 Fetch current user's profile picture
         const currentUserProfilePic = viewer?.profilePicture || "";
         const currentUserIdStr = viewer ? viewer._id.toString() : (currentUserId ? currentUserId.toString() : "");
 
-        // 🔁 Enhance reels with follow status + profile pics
-        const enhancedReels = await Promise.all(
-            reels.map(async (reel) => {
-                const reelOwner = await User.findById(
-                    reel.user,
-                    "profilePicture followers"
-                ).lean();
+        // 🚀 OPTIMIZATION 4: Fast synchronous loop (Promise.all ki zarurat khatam)
+        const enhancedReels = new Array(reels.length);
+        for (let i = 0; i < reels.length; i++) {
+            const reel = reels[i];
+            const reelOwner = reel.user || {}; // Data is already here because of .populate!
 
-                const reelUserProfilePic = reelOwner?.profilePicture || "";
+            let isFollowing = false;
+            if (currentUserIdStr && reelOwner.followers && reelOwner.followers.length > 0) {
+                for (let j = 0; j < reelOwner.followers.length; j++) {
+                    if (reelOwner.followers[j].toString() === currentUserIdStr) {
+                        isFollowing = true;
+                        break; // condition milte hi loop roko
+                    }
+                }
+            }
 
-                const isFollowing = reelOwner?.followers?.some(
-                    (followerId) =>
-                        followerId.toString() === currentUserIdStr
-                );
+            // Frontend ko ID expected hai 'user' field me
+            const ownerIdStr = reelOwner._id ? reelOwner._id.toString() : reel.user;
 
-                return {
-                    ...reel,
-                    reelUserProfilePic,
-                    currentUserProfilePic,
-                    isFollowing: !!isFollowing,
-                };
-            })
-        );
+            enhancedReels[i] = {
+                ...reel,
+                user: ownerIdStr,
+                reelUserProfilePic: reelOwner.profilePicture || "",
+                currentUserProfilePic,
+                isFollowing: isFollowing,
+            };
+        }
 
-        res.status(200).json(enhancedReels);
+        return res.status(200).json(enhancedReels);
 
     } catch (error) {
         console.error(error);
-        error.statusCode = error.statusCode || 500;
-        await logError(req, error);
-        res.status(500).json({ message: "Server error" });
+        if (!res.headersSent) {
+            error.statusCode = error.statusCode || 500;
+            if (typeof logError === "function") await logError(req, error);
+            res.status(500).json({ message: "Server error" });
+        }
     }
 });
 
@@ -1361,6 +1364,8 @@ router.put("/update/:id", async (req, res) => {
             videoUrl: updatedReel.videoUrl,
             thumbnailUrl: updatedReel.thumbnailUrl,
             caption: updatedReel.caption,
+            captionTime: updatedReel.captionTime,
+            captionUpdatedAt: updatedReel.captionUpdatedAt,
             duration: updatedReel.duration,
             music: updatedReel.music,
         });

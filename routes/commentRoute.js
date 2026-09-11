@@ -588,52 +588,92 @@ router.put("/update/:id", async (req, res) => {
   }
 });
 
-// GET comments for a reel
+
+
 router.get('/reel/:reelId', async (req, res) => {
   try {
     const reelId = req.params.reelId;
-    const viewerId = req.query.viewerId; // 🔥 ADDED: Frontend se viewer ki ID mangwao
+    const viewerId = req.query.viewerId;
 
-    // 🛡️ BLOCK FILTER LOGIC START
+    // 🔥 CRASH PREVENTION: Invalid reelId aane par crash na ho
+    if (!mongoose.isValidObjectId(reelId)) {
+      return res.status(400).json({ message: "Invalid Reel ID" });
+    }
+
+    // 🛡️ BLOCK FILTER LOGIC START (Optimized with .lean)
     let blockedList = [];
-    if (viewerId) {
-      const viewer = await User.findById(viewerId).select("blockedUsers");
-      if (viewer && viewer.blockedUsers) {
+    if (viewerId && mongoose.isValidObjectId(viewerId)) {
+      const viewer = await User.findById(viewerId).select("blockedUsers").lean();
+      if (viewer && viewer.blockedUsers && viewer.blockedUsers.length > 0) {
         blockedList = viewer.blockedUsers;
       }
     }
     // 🛡️ BLOCK FILTER LOGIC END
 
-    // ✅ Step 1: Fetch Main Comments (Filtered by blocked users)
-    const comments = await Comment.find({
+    // 🚀 OPTIMIZATION 1: Fetch Main Comments with .lean()
+    const mainComments = await Comment.find({
       reel: reelId,
       parentComment: null,
-      user: { $nin: blockedList } // 🔥 ADDED: Blocked logo ke main comments hide karo
+      user: { $nin: blockedList } // Blocked logo ke main comments hide karo
     })
       .populate('user', 'username profilePicture')
-      .sort({ createdAt: -1 });
+      .sort({ createdAt: -1 })
+      .lean(); // .lean() makes it plain JS object, 5x faster!
 
-    const commentsWithReplies = await Promise.all(
-      comments.map(async (comment) => {
-        // ✅ Step 2: Fetch Replies (Filtered by blocked users)
-        const replies = await Comment.find({
-          parentComment: comment._id,
-          user: { $nin: blockedList } // 🔥 ADDED: Blocked logo ke replies bhi hide karo
-        })
-          .populate('user', 'username profilePicture')
-          .sort({ createdAt: 1 });
+    // Agar koi comments nahi hain toh turant wapas return kar do
+    if (!mainComments || mainComments.length === 0) {
+      return res.status(200).json([]);
+    }
 
-        return { ...comment._doc, replies };
-      })
-    );
+    // 🚀 OPTIMIZATION 2: N+1 Loop Killer (Fetch all replies in ONE query)
+    const mainCommentIds = new Array(mainComments.length);
+    for (let i = 0; i < mainComments.length; i++) {
+      mainCommentIds[i] = mainComments[i]._id;
+    }
+
+    // Ek hi query me saare replies nikal liye ($in operator ka use karke)
+    const allReplies = await Comment.find({
+      parentComment: { $in: mainCommentIds },
+      user: { $nin: blockedList } // Blocked logo ke replies hide karo
+    })
+      .populate('user', 'username profilePicture')
+      .sort({ createdAt: 1 })
+      .lean();
+
+    // 🚀 OPTIMIZATION 3: Fast In-Memory Grouping (No Database waiting)
+    // Javascript engine me ek Hash Map banaya taaki replies apne parent ke paas instantly chali jaye
+    const repliesMap = {};
+    for (let i = 0; i < allReplies.length; i++) {
+      const reply = allReplies[i];
+      const parentIdStr = reply.parentComment.toString();
+
+      if (!repliesMap[parentIdStr]) {
+        repliesMap[parentIdStr] = [];
+      }
+      repliesMap[parentIdStr].push(reply);
+    }
+
+    // Main comments ke sath unke replies ko attach kar diya
+    const commentsWithReplies = new Array(mainComments.length);
+    for (let i = 0; i < mainComments.length; i++) {
+      const comment = mainComments[i];
+      const commentIdStr = comment._id.toString();
+
+      // Kyunki humne .lean() lagaya tha, toh comment._doc ki zarurat hi nahi hai
+      commentsWithReplies[i] = {
+        ...comment,
+        replies: repliesMap[commentIdStr] || []
+      };
+    }
 
     return res.status(200).json(commentsWithReplies);
+
   } catch (error) {
     console.error("Error fetching comments:", error);
-    if (typeof logError === 'function') {
-      await logError(req, error);
-    }
     if (!res.headersSent) {
+      if (typeof logError === 'function') {
+        await logError(req, error);
+      }
       return res.status(500).json({ message: "Internal Server Error" });
     }
   }

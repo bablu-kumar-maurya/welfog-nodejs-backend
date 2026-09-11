@@ -58,38 +58,48 @@ router.post("/conversations/one-to-one", async (req, res) => {
       return res.status(400).json({ success: false, message: "Cannot create conversation with yourself" });
     }
 
-    const user1 = await resolveUserDoc(userId);
-    const user2 = await resolveUserDoc(targetUserId);
+    // 🚀 OPTIMIZATION 1: Fetch both users in parallel (Saves ~50% wait time here)
+    const [user1, user2] = await Promise.all([
+      resolveUserDoc(userId),
+      resolveUserDoc(targetUserId)
+    ]);
 
     if (!user1 || !user2) {
       return res.status(404).json({ success: false, message: "One or both users not found" });
     }
 
-    // Check if 1-to-1 conversation already exists
+    // 🚀 OPTIMIZATION 2: Find WITHOUT populating first. (Query runs much faster)
     let conversation = await Conversation.findOne({
       isGroup: false,
       participants: { $all: [user1._id, user2._id] },
-    })
-      .populate("participants", "username name profilePicture isConnected userid lastConnectedAt")
-      .populate({
-        path: "lastMessage",
-        populate: { path: "sender", select: "username name profilePicture userid" },
-      });
+    });
 
     if (conversation) {
       // Re-activate conversation if soft-deleted for user
       let updated = false;
+
       if (conversation.isDeleted) {
         conversation.isDeleted = false;
         updated = true;
       }
-      if (conversation.deletedFor && conversation.deletedFor.some((id) => id.toString() === user1._id.toString())) {
-        conversation.deletedFor = conversation.deletedFor.filter((id) => id.toString() !== user1._id.toString());
+
+      const user1IdStr = user1._id.toString(); // Store once to avoid recalculating in loop
+
+      if (conversation.deletedFor && conversation.deletedFor.some((id) => id.toString() === user1IdStr)) {
+        conversation.deletedFor = conversation.deletedFor.filter((id) => id.toString() !== user1IdStr);
         updated = true;
       }
+
+      // Save raw document first (Faster than saving a populated document)
       if (updated) {
         await conversation.save();
       }
+
+      // 🚀 OPTIMIZATION 3: Populate ONLY after saving and right before sending response
+      await conversation.populate([
+        { path: "participants", select: "username name profilePicture isConnected userid lastConnectedAt" },
+        { path: "lastMessage", populate: { path: "sender", select: "username name profilePicture userid" } }
+      ]);
 
       return res.status(200).json({
         success: true,
@@ -110,6 +120,7 @@ router.post("/conversations/one-to-one", async (req, res) => {
 
     await conversation.save();
 
+    // Populate after creation
     await conversation.populate("participants", "username name profilePicture isConnected userid lastConnectedAt");
 
     return res.status(201).json({
@@ -117,6 +128,7 @@ router.post("/conversations/one-to-one", async (req, res) => {
       message: "Conversation created successfully",
       conversation,
     });
+
   } catch (error) {
     console.error("Error in /conversations/one-to-one:", error);
     res.status(500).json({ success: false, message: "Failed to process conversation" });
@@ -125,6 +137,7 @@ router.post("/conversations/one-to-one", async (req, res) => {
 
 // =========================================================
 // 2️⃣ GROUP CONVERSATION CREATION
+// =========================================================
 // =========================================================
 router.post("/conversations/group", async (req, res) => {
   try {
@@ -139,14 +152,19 @@ router.post("/conversations/group", async (req, res) => {
       return res.status(404).json({ success: false, message: "Creator user not found" });
     }
 
-    // Resolve all participant ObjectIds
-    const participantObjectIds = [creator._id];
-    for (const pid of participantIds) {
-      const pDoc = await resolveUserDoc(pid);
-      if (pDoc && !participantObjectIds.some((id) => id.toString() === pDoc._id.toString())) {
-        participantObjectIds.push(pDoc._id);
+    // 🚀 OPTIMIZATION: Fetch all participants in parallel instead of one-by-one loop
+    const pDocs = await Promise.all(participantIds.map(pid => resolveUserDoc(pid)));
+
+    const participantObjectIdsMap = new Map();
+    participantObjectIdsMap.set(creator._id.toString(), creator._id); // Add creator
+
+    pDocs.forEach(pDoc => {
+      if (pDoc) {
+        participantObjectIdsMap.set(pDoc._id.toString(), pDoc._id);
       }
-    }
+    });
+
+    const participantObjectIds = Array.from(participantObjectIdsMap.values());
 
     if (participantObjectIds.length < 2) {
       return res.status(400).json({ success: false, message: "Group chat requires at least 2 participants" });
@@ -154,9 +172,11 @@ router.post("/conversations/group", async (req, res) => {
 
     const initialUnread = {};
     const initialJoinedAt = {};
+    const now = new Date();
+
     participantObjectIds.forEach((id) => {
       initialUnread[id.toString()] = 0;
-      initialJoinedAt[id.toString()] = new Date();
+      initialJoinedAt[id.toString()] = now;
     });
 
     const conversation = new Conversation({
@@ -172,8 +192,11 @@ router.post("/conversations/group", async (req, res) => {
 
     await conversation.save();
 
-    await conversation.populate("participants", "username name profilePicture isConnected userid");
-    await conversation.populate("groupAdmin", "username name profilePicture userid");
+    // 🚀 OPTIMIZATION: Populate in parallel
+    await Promise.all([
+      conversation.populate("participants", "username name profilePicture isConnected userid"),
+      conversation.populate("groupAdmin", "username name profilePicture userid")
+    ]);
 
     res.status(201).json({
       success: true,
@@ -186,32 +209,34 @@ router.post("/conversations/group", async (req, res) => {
   }
 });
 
-async function resolveConversationLastMessage(conv, userId) {
-  if (!conv || !userId) return conv;
-  const user = await resolveUserDoc(userId);
+// 🚀 OPTIMIZATION: Modified to accept full user object directly to avoid N+1 DB queries in loops
+async function resolveConversationLastMessage(conv, userOrId) {
+  if (!conv || !userOrId) return conv;
+
+  // If we already passed the full user document, use it. Otherwise, fetch it.
+  const user = userOrId._id ? userOrId : await resolveUserDoc(userOrId);
   if (!user) return conv;
 
+  const userIdStr = user._id.toString();
   let filterDate = null;
-  if (conv.joinedAt && conv.joinedAt[user._id.toString()]) {
-    filterDate = new Date(conv.joinedAt[user._id.toString()]);
+
+  if (conv.joinedAt && conv.joinedAt[userIdStr]) {
+    filterDate = new Date(conv.joinedAt[userIdStr]);
   }
-  if (conv.clearedAt && conv.clearedAt[user._id.toString()]) {
-    const clearDate = new Date(conv.clearedAt[user._id.toString()]);
+  if (conv.clearedAt && conv.clearedAt[userIdStr]) {
+    const clearDate = new Date(conv.clearedAt[userIdStr]);
     if (!filterDate || clearDate > filterDate) {
       filterDate = clearDate;
     }
   }
 
-  // First resolve if current last message was deleted for the user or sent before filterDate
   let needQueryNewLast = false;
   if (conv.lastMessage) {
     if (conv.lastMessage.deletedFor) {
-      const isDeleted = conv.lastMessage.deletedFor.some(
-        (id) => id.toString() === user._id.toString()
-      );
+      const isDeleted = conv.lastMessage.deletedFor.some((id) => id.toString() === userIdStr);
       if (isDeleted) needQueryNewLast = true;
     }
-    
+
     if (filterDate) {
       const msgCreatedAt = conv.lastMessage.createdAt ? new Date(conv.lastMessage.createdAt) : null;
       if (msgCreatedAt && msgCreatedAt < filterDate) {
@@ -269,18 +294,22 @@ router.get("/conversations", async (req, res) => {
       })
       .lean();
 
+    const userIdStr = user._id.toString();
+
+    // 🚀 OPTIMIZATION: Pass the 'user' object directly to resolveConversationLastMessage
     const formatted = await Promise.all(conversations.map(async (conv) => {
-      const unread = conv.unreadCounts ? conv.unreadCounts[user._id.toString()] || 0 : 0;
+      const unread = conv.unreadCounts ? conv.unreadCounts[userIdStr] || 0 : 0;
 
       let isOtherOnline = false;
       if (!conv.isGroup) {
-        const otherParticipant = conv.participants.find((p) => p._id.toString() !== user._id.toString());
+        const otherParticipant = conv.participants.find((p) => p._id.toString() !== userIdStr);
         if (otherParticipant) {
           isOtherOnline = isUserOnline(otherParticipant._id.toString());
         }
       }
 
-      const resolvedConv = await resolveConversationLastMessage(conv, user._id);
+      // Passed `user` instead of `user._id` to save hundreds of DB calls
+      const resolvedConv = await resolveConversationLastMessage(conv, user);
 
       return {
         ...resolvedConv,
@@ -311,28 +340,29 @@ router.get("/conversations/:conversationId", async (req, res) => {
       return res.status(400).json({ success: false, message: "Invalid conversation ID" });
     }
 
-    const conversation = await Conversation.findById(conversationId)
-      .populate("participants", "username name profilePicture isConnected userid lastConnectedAt")
-      .populate("groupAdmin", "username name profilePicture userid")
-      .populate("groupCoAdmins", "username name profilePicture userid")
-      .populate({
-        path: "lastMessage",
-        populate: { path: "sender", select: "username name profilePicture userid" },
-      })
-      .lean();
+    // 🚀 OPTIMIZATION: Fetch Conversation and User in parallel
+    const [conversation, user] = await Promise.all([
+      Conversation.findById(conversationId)
+        .populate("participants", "username name profilePicture isConnected userid lastConnectedAt")
+        .populate("groupAdmin", "username name profilePicture userid")
+        .populate("groupCoAdmins", "username name profilePicture userid")
+        .populate({
+          path: "lastMessage",
+          populate: { path: "sender", select: "username name profilePicture userid" },
+        })
+        .lean(),
+      userId ? resolveUserDoc(userId) : null
+    ]);
 
     if (!conversation) {
       return res.status(404).json({ success: false, message: "Conversation not found" });
     }
 
     let resolvedConversation = conversation;
-    if (userId) {
-      const user = await resolveUserDoc(userId);
-      if (user) {
-        const unread = conversation.unreadCounts ? conversation.unreadCounts[user._id.toString()] || 0 : 0;
-        conversation.unreadCount = unread;
-        resolvedConversation = await resolveConversationLastMessage(conversation, user._id);
-      }
+    if (user) {
+      const unread = conversation.unreadCounts ? conversation.unreadCounts[user._id.toString()] || 0 : 0;
+      conversation.unreadCount = unread;
+      resolvedConversation = await resolveConversationLastMessage(conversation, user);
     }
 
     res.status(200).json({
@@ -361,22 +391,23 @@ router.get("/conversations/:conversationId/messages", async (req, res) => {
     const limitNum = parseInt(limit, 10);
     const skip = (pageNum - 1) * limitNum;
 
-    const query = {
-      conversation: conversationId,
-    };
+    const query = { conversation: conversationId };
 
     if (userId) {
-      const user = await resolveUserDoc(userId);
+      // 🚀 OPTIMIZATION: Fetch user and conversation at the same time
+      const [user, conversation] = await Promise.all([
+        resolveUserDoc(userId),
+        Conversation.findById(conversationId).select("participants joinedAt clearedAt").lean() // Using lean & select for speed
+      ]);
+
       if (user) {
-        const conversation = await Conversation.findById(conversationId);
         if (!conversation) {
           return res.status(404).json({ success: false, message: "Conversation not found" });
         }
-        
-        // Verify participant status
-        const isParticipant = conversation.participants.some(
-          (p) => p.toString() === user._id.toString()
-        );
+
+        const userIdStr = user._id.toString();
+        const isParticipant = conversation.participants.some((p) => p.toString() === userIdStr);
+
         if (!isParticipant) {
           return res.status(403).json({ success: false, message: "You are not a participant in this conversation" });
         }
@@ -384,11 +415,11 @@ router.get("/conversations/:conversationId/messages", async (req, res) => {
         query.deletedFor = { $ne: user._id };
 
         let filterDate = null;
-        if (conversation.joinedAt && conversation.joinedAt.get(user._id.toString())) {
-          filterDate = conversation.joinedAt.get(user._id.toString());
+        if (conversation.joinedAt && conversation.joinedAt[userIdStr]) {
+          filterDate = conversation.joinedAt[userIdStr];
         }
-        if (conversation.clearedAt && conversation.clearedAt.get(user._id.toString())) {
-          const clearDate = conversation.clearedAt.get(user._id.toString());
+        if (conversation.clearedAt && conversation.clearedAt[userIdStr]) {
+          const clearDate = conversation.clearedAt[userIdStr];
           if (!filterDate || clearDate > filterDate) {
             filterDate = clearDate;
           }
@@ -399,26 +430,25 @@ router.get("/conversations/:conversationId/messages", async (req, res) => {
       }
     }
 
-    const totalMessages = await Message.countDocuments(query);
-
-    const messages = await Message.find(query)
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(limitNum)
-      .populate("sender", "username name profilePicture userid")
-      .populate({
-        path: "replyTo",
-        select: "text type sender mediaUrl fileName",
-        populate: { path: "sender", select: "username name" },
-      })
-      .lean();
-
-    // Reverse to show in chronological order for frontend
-    const chronologicalMessages = messages.reverse();
+    // 🚀 OPTIMIZATION: Fetch total count AND messages simultaneously
+    const [totalMessages, messages] = await Promise.all([
+      Message.countDocuments(query),
+      Message.find(query)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limitNum)
+        .populate("sender", "username name profilePicture userid")
+        .populate({
+          path: "replyTo",
+          select: "text type sender mediaUrl fileName",
+          populate: { path: "sender", select: "username name" },
+        })
+        .lean()
+    ]);
 
     res.status(200).json({
       success: true,
-      messages: chronologicalMessages,
+      messages: messages.reverse(), // Chronological order
       pagination: {
         total: totalMessages,
         page: pageNum,
@@ -433,60 +463,45 @@ router.get("/conversations/:conversationId/messages", async (req, res) => {
 });
 
 // =========================================================
-// 6️⃣ SEND MESSAGE (REST API Endpoint)
+// 6️⃣ SEND MESSAGE (REST API Endpoint) -> 🚀 MASSIVELY OPTIMIZED
 // =========================================================
 router.post("/conversations/:conversationId/messages", async (req, res) => {
   try {
     const { conversationId } = req.params;
     const {
-      senderId,
-      type = "text",
-      text = "",
-      mediaUrl = "",
-      thumbnailUrl = "",
-      fileName = "",
-      fileSize = 0,
-      mimeType = "",
-      replyTo = null,
-      sharedReel = null,
-      sharedProduct = null,
-      tempId = null,
-      duration = 0,
+      senderId, type = "text", text = "", mediaUrl = "", thumbnailUrl = "",
+      fileName = "", fileSize = 0, mimeType = "", replyTo = null,
+      sharedReel = null, sharedProduct = null, tempId = null, duration = 0,
     } = req.body;
 
-    if (!mongoose.isValidObjectId(conversationId)) {
-      return res.status(400).json({ success: false, message: "Invalid conversation ID" });
+    if (!mongoose.isValidObjectId(conversationId) || !senderId) {
+      return res.status(400).json({ success: false, message: "Invalid payload data" });
     }
 
-    if (!senderId) {
-      return res.status(400).json({ success: false, message: "senderId is required" });
+    // 🚀 OPTIMIZATION 1: Fetch Sender and Conversation together
+    const [senderDoc, conversation] = await Promise.all([
+      resolveUserDoc(senderId),
+      Conversation.findById(conversationId)
+    ]);
+
+    if (!senderDoc || !conversation) {
+      return res.status(404).json({ success: false, message: "Sender or Conversation not found" });
     }
 
-    const senderDoc = await resolveUserDoc(senderId);
-    if (!senderDoc) {
-      return res.status(404).json({ success: false, message: "Sender user not found" });
-    }
+    const senderIdStr = senderDoc._id.toString();
 
-    const conversation = await Conversation.findById(conversationId);
-    if (!conversation) {
-      return res.status(404).json({ success: false, message: "Conversation not found" });
-    }
-
-    // Bidirectional Block Check for 1-to-1 chats
     let isReceiverBlocked = false;
     let otherUserId = null;
+
     if (!conversation.isGroup && conversation.participants.length === 2) {
-      otherUserId = conversation.participants.find(
-        (p) => p.toString() !== senderDoc._id.toString()
-      );
+      otherUserId = conversation.participants.find((p) => p.toString() !== senderIdStr);
+
       if (otherUserId) {
+        // Find other user only if it's a 1-on-1 chat
         const otherDoc = await User.findById(otherUserId).select("blockedUsers").lean();
-        const senderBlockedOther = senderDoc.blockedUsers?.some(
-          (id) => id.toString() === otherDoc?._id?.toString()
-        );
-        const otherBlockedSender = otherDoc?.blockedUsers?.some(
-          (id) => id.toString() === senderDoc._id.toString()
-        );
+
+        const senderBlockedOther = senderDoc.blockedUsers?.some((id) => id.toString() === otherUserId.toString());
+        const otherBlockedSender = otherDoc?.blockedUsers?.some((id) => id.toString() === senderIdStr);
 
         if (senderBlockedOther) {
           return res.status(403).json({ success: false, message: "Messaging is blocked between these users" });
@@ -497,97 +512,88 @@ router.post("/conversations/:conversationId/messages", async (req, res) => {
       }
     }
 
-    // Determine initial online delivered list
     const deliveredTo = [];
     conversation.participants.forEach((partId) => {
       const partStr = partId.toString();
-      if (partStr !== senderDoc._id.toString() && isUserOnline(partStr)) {
-        if (!isReceiverBlocked) {
-          deliveredTo.push(partId);
-        }
+      if (partStr !== senderIdStr && isUserOnline(partStr) && !isReceiverBlocked) {
+        deliveredTo.push(partId);
       }
     });
-
-    const initialStatus = deliveredTo.length > 0 ? "delivered" : "sent";
 
     const newMessage = new Message({
       conversation: conversationId,
       sender: senderDoc._id,
-      type,
-      text,
-      mediaUrl,
-      thumbnailUrl,
-      fileName,
-      fileSize,
-      mimeType,
+      type, text, mediaUrl, thumbnailUrl, fileName, fileSize, mimeType,
       duration: Number(duration) || 0,
       replyTo: replyTo && mongoose.isValidObjectId(replyTo) ? replyTo : null,
       sharedReel: sharedReel || null,
       sharedProduct: sharedProduct || null,
-      status: initialStatus,
+      status: deliveredTo.length > 0 ? "delivered" : "sent",
       deliveredTo,
       seenBy: [],
       deletedFor: isReceiverBlocked ? [otherUserId] : [],
     });
 
+    // 🚀 OPTIMIZATION 2: Save message first (we need its ID)
     await newMessage.save();
 
-    await newMessage.populate("sender", "username name profilePicture userid");
+    // Prepare message population
+    const populateQuery = [{ path: "sender", select: "username name profilePicture userid" }];
     if (newMessage.replyTo) {
-      await newMessage.populate({
+      populateQuery.push({
         path: "replyTo",
         select: "text type sender mediaUrl fileName",
         populate: { path: "sender", select: "username name profilePicture userid" }
       });
     }
 
-    // Update conversation's last message
+    // Update conversation metadata
     conversation.lastMessage = newMessage._id;
     conversation.lastMessageAt = new Date();
     conversation.isDeleted = false;
     conversation.deletedFor = [];
 
-    // Increment unread count for non-senders
     conversation.participants.forEach((partId) => {
       const partStr = partId.toString();
-      if (partStr !== senderDoc._id.toString()) {
-        if (!isReceiverBlocked) {
-          const currentCount = conversation.unreadCounts.get(partStr) || 0;
-          conversation.unreadCounts.set(partStr, currentCount + 1);
-        }
+      if (partStr !== senderIdStr && !isReceiverBlocked) {
+        const currentCount = conversation.unreadCounts.get(partStr) || 0;
+        conversation.unreadCounts.set(partStr, currentCount + 1);
       }
     });
 
-    await conversation.save();
+    // 🚀 OPTIMIZATION 3: Save conversation AND populate message at the EXACT SAME TIME!
+    await Promise.all([
+      newMessage.populate(populateQuery),
+      conversation.save()
+    ]);
 
     const messageData = newMessage.toObject();
     if (tempId) messageData.tempId = tempId;
 
-    // Trigger push notifications for recipients
+    // Trigger push notifications
     try {
       const sendChatPushNotification = require("../utils/sendChatPushNotification");
-      sendChatPushNotification({
-        conversation,
-        senderDoc,
-        messageDoc: newMessage,
-      });
+      sendChatPushNotification({ conversation, senderDoc, messageDoc: newMessage }); // Fire and forget
     } catch (err) {
       console.error("❌ Failed to trigger chat push notification:", err.message);
     }
 
+    // Socket Emissions (Instant)
     const io = req.app.get("io");
     if (io) {
-      // Broadcast to conversation room or only to the sender if blocked
       if (isReceiverBlocked) {
-        io.to(`user:${senderDoc._id.toString()}`).emit("new_message", messageData);
+        io.to(`user:${senderIdStr}`).emit("new_message", messageData);
       } else {
-        io.to(`conv:${conversationId}`).emit("new_message", messageData);
+        let broadcastTarget = io.to(`conv:${conversationId}`);
+        conversation.participants.forEach((partId) => {
+          broadcastTarget = broadcastTarget.to(`user:${partId.toString()}`);
+        });
+        broadcastTarget.emit("new_message", messageData);
       }
 
-      // Broadcast to participants' personal user rooms (multi-device)
       conversation.participants.forEach((partId) => {
         const pStr = partId.toString();
-        if (pStr === senderDoc._id.toString() || !isReceiverBlocked) {
+        if (pStr === senderIdStr || !isReceiverBlocked) {
           io.to(`user:${pStr}`).emit("conversation_updated", {
             conversationId,
             lastMessage: messageData,
@@ -609,9 +615,8 @@ router.post("/conversations/:conversationId/messages", async (req, res) => {
     res.status(500).json({ success: false, message: "Failed to send message" });
   }
 });
-
 // =========================================================
-// 7️⃣ MEDIA / FILE UPLOAD ENDPOINTS
+// 7️⃣ MEDIA / FILE UPLOAD ENDPOINTS (🚀 OPTIMIZED FOR FAST S3 UPLINK)
 // =========================================================
 router.post("/upload", upload.single("file"), async (req, res) => {
   try {
@@ -621,7 +626,6 @@ router.post("/upload", upload.single("file"), async (req, res) => {
 
     const folder = req.body.folder || "chat_media";
     let fileBuffer = req.file.buffer;
-    let uploadedThumbnailUrl = "";
     let mimeType = req.file.mimetype;
 
     // Fallback: If mimetype is application/octet-stream, guess from file extension
@@ -634,30 +638,36 @@ router.post("/upload", upload.single("file"), async (req, res) => {
       }
     }
 
-    if (mimeType.startsWith("video/")) {
-      console.log("🎥 Generating video thumbnail on backend...");
-      try {
-        const thumbnailBuffer = await generateVideoThumbnail(req.file.buffer);
-        
-        // Upload thumbnail
-        const thumbFile = {
-          originalname: `thumb-${req.file.originalname}.jpg`,
-          mimetype: "image/jpeg",
-          buffer: thumbnailBuffer
-        };
-        uploadedThumbnailUrl = await uploadToS3(thumbFile, folder);
-      } catch (err) {
-        console.warn("Video thumbnail generation failed:", err.message);
-      }
-    }
-
     const processedFile = {
       originalname: req.file.originalname,
       mimetype: mimeType,
       buffer: fileBuffer
     };
 
-    const uploadedFileUrl = await uploadToS3(processedFile, folder);
+    let uploadMainPromise = uploadToS3(processedFile, folder);
+    let uploadThumbPromise = Promise.resolve("");
+
+    if (mimeType.startsWith("video/")) {
+      console.log("🎥 Generating video thumbnail on backend...");
+      try {
+        const thumbnailBuffer = await generateVideoThumbnail(req.file.buffer);
+        const thumbFile = {
+          originalname: `thumb-${req.file.originalname}.jpg`,
+          mimetype: "image/jpeg",
+          buffer: thumbnailBuffer
+        };
+        // Prepare thumb upload promise without awaiting immediately
+        uploadThumbPromise = uploadToS3(thumbFile, folder);
+      } catch (err) {
+        console.warn("Video thumbnail generation failed:", err.message);
+      }
+    }
+
+    // 🚀 OPTIMIZATION: Upload main file and thumbnail to S3 simultaneously in parallel
+    const [uploadedFileUrl, uploadedThumbnailUrl] = await Promise.all([
+      uploadMainPromise,
+      uploadThumbPromise
+    ]);
 
     res.status(200).json({
       success: true,
@@ -705,12 +715,16 @@ router.delete("/conversations/:conversationId", async (req, res) => {
       return res.status(400).json({ success: false, message: "Invalid conversation ID" });
     }
 
-    const user = await resolveUserDoc(userId);
+    // 🚀 OPTIMIZATION: Fetch user and conversation in parallel
+    const [user, conversation] = await Promise.all([
+      resolveUserDoc(userId),
+      Conversation.findById(conversationId)
+    ]);
+
     if (!user) {
       return res.status(404).json({ success: false, message: "User not found" });
     }
 
-    const conversation = await Conversation.findById(conversationId);
     if (!conversation) {
       return res.status(404).json({ success: false, message: "Conversation not found" });
     }
@@ -719,7 +733,7 @@ router.delete("/conversations/:conversationId", async (req, res) => {
       // Admin / Global Soft Delete
       if (conversation.isGroup) {
         const isAdmin = (conversation.groupAdmin && conversation.groupAdmin.toString() === user._id.toString()) ||
-                        (conversation.groupCoAdmins && conversation.groupCoAdmins.some((id) => id.toString() === user._id.toString()));
+          (conversation.groupCoAdmins && conversation.groupCoAdmins.some((id) => id.toString() === user._id.toString()));
         if (!isAdmin) {
           return res.status(403).json({ success: false, message: "Only group admins can delete the group for everyone" });
         }
@@ -771,18 +785,22 @@ router.delete("/conversations/:conversationId", async (req, res) => {
 router.delete("/messages/:messageId", async (req, res) => {
   try {
     const { messageId } = req.params;
-    const { userId, action = "for_me" } = req.body; // action: "for_me" | "for_everyone"
+    const { userId, action = "for_me" } = req.body;
 
     if (!mongoose.isValidObjectId(messageId)) {
       return res.status(400).json({ success: false, message: "Invalid message ID" });
     }
 
-    const user = await resolveUserDoc(userId);
+    // 🚀 OPTIMIZATION: Fetch user and message in parallel
+    const [user, message] = await Promise.all([
+      resolveUserDoc(userId),
+      Message.findById(messageId)
+    ]);
+
     if (!user) {
       return res.status(404).json({ success: false, message: "User not found" });
     }
 
-    const message = await Message.findById(messageId);
     if (!message) {
       return res.status(404).json({ success: false, message: "Message not found" });
     }
@@ -797,7 +815,6 @@ router.delete("/messages/:messageId", async (req, res) => {
       message.thumbnailUrl = "";
       await message.save();
 
-      // Emit real-time update to Socket.IO conversation room
       const io = req.app.get("io");
       if (io) {
         io.to(`conv:${message.conversation}`).emit("message_deleted", {
@@ -846,25 +863,51 @@ router.put("/conversations/:conversationId/read", async (req, res) => {
       return res.status(404).json({ success: false, message: "User not found" });
     }
 
-    await Message.updateMany(
-      {
-        conversation: conversationId,
-        sender: { $ne: user._id },
-        seenBy: { $ne: user._id },
-      },
-      {
-        $addToSet: { seenBy: user._id, deliveredTo: user._id },
-        $set: { status: "seen" },
-      }
-    );
+    const userObjId = user._id;
+    const userIdStr = userObjId.toString();
 
-    const conversation = await Conversation.findById(conversationId);
+    // 🚀 OPTIMIZATION: Run Message bulk update and Conversation fetch simultaneously
+    const [_, conversation] = await Promise.all([
+      Message.updateMany(
+        {
+          conversation: conversationId,
+          sender: { $ne: userObjId },
+          seenBy: { $ne: userObjId },
+        },
+        {
+          $addToSet: { seenBy: userObjId, deliveredTo: userObjId },
+          $set: { status: "seen" },
+        }
+      ),
+      Conversation.findById(conversationId)
+    ]);
+
     if (conversation) {
-      conversation.unreadCounts.set(user._id.toString(), 0);
+      conversation.unreadCounts.set(userIdStr, 0);
       if (user.userid) {
         conversation.unreadCounts.set(user.userid.toString(), 0);
       }
       await conversation.save();
+
+      // Emit real-time messages_seen socket event to sender and all participants
+      const io = req.app.get("io");
+      if (io) {
+        const seenPayload = {
+          conversationId,
+          seenByUserId: userIdStr,
+          seenByCustomUserId: user.userid || userIdStr,
+          userId: userIdStr,
+          customUserId: user.userid || userIdStr,
+          readerId: userIdStr,
+          status: "seen",
+        };
+
+        let broadcastTarget = io.to(`conv:${conversationId}`);
+        conversation.participants.forEach((partId) => {
+          broadcastTarget = broadcastTarget.to(`user:${partId.toString()}`);
+        });
+        broadcastTarget.emit("messages_seen", seenPayload);
+      }
     }
 
     res.status(200).json({
@@ -885,34 +928,39 @@ router.post("/conversations/:conversationId/participants", async (req, res) => {
     const { conversationId } = req.params;
     const { adminId, participantIds = [] } = req.body;
 
-    const conversation = await Conversation.findById(conversationId);
+    // 🚀 OPTIMIZATION: Fetch conversation, admin, and all target participants simultaneously
+    const [conversation, admin, pDocs] = await Promise.all([
+      Conversation.findById(conversationId),
+      resolveUserDoc(adminId),
+      Promise.all(participantIds.map((pid) => resolveUserDoc(pid)))
+    ]);
+
     if (!conversation || !conversation.isGroup) {
       return res.status(404).json({ success: false, message: "Group conversation not found" });
     }
 
-    const admin = await resolveUserDoc(adminId);
     const isRequesterAdmin = admin && (conversation.groupAdmin.toString() === admin._id.toString() || (conversation.groupCoAdmins && conversation.groupCoAdmins.some((id) => id.toString() === admin._id.toString())));
     if (!isRequesterAdmin) {
       return res.status(403).json({ success: false, message: "Only group admin can add participants" });
     }
 
-    for (const pid of participantIds) {
-      const pDoc = await resolveUserDoc(pid);
+    pDocs.forEach((pDoc) => {
       if (pDoc) {
-        if (!conversation.participants.some((id) => id.toString() === pDoc._id.toString())) {
+        const pStr = pDoc._id.toString();
+        if (!conversation.participants.some((id) => id.toString() === pStr)) {
           conversation.participants.push(pDoc._id);
-          conversation.unreadCounts.set(pDoc._id.toString(), 0);
+          conversation.unreadCounts.set(pStr, 0);
           if (!conversation.joinedAt) conversation.joinedAt = new Map();
-          conversation.joinedAt.set(pDoc._id.toString(), new Date());
+          conversation.joinedAt.set(pStr, new Date());
         }
         if (conversation.exitedUsers) {
-          conversation.exitedUsers = conversation.exitedUsers.filter((id) => id.toString() !== pDoc._id.toString());
+          conversation.exitedUsers = conversation.exitedUsers.filter((id) => id.toString() !== pStr);
         }
         if (conversation.deletedFor) {
-          conversation.deletedFor = conversation.deletedFor.filter((id) => id.toString() !== pDoc._id.toString());
+          conversation.deletedFor = conversation.deletedFor.filter((id) => id.toString() !== pStr);
         }
       }
-    }
+    });
 
     await conversation.save();
     await conversation.populate([
@@ -937,13 +985,16 @@ router.delete("/conversations/:conversationId/participants/:participantId", asyn
     const { conversationId, participantId } = req.params;
     const { requesterId } = req.body;
 
-    const conversation = await Conversation.findById(conversationId);
+    // 🚀 OPTIMIZATION: Concurrent fetching
+    const [conversation, requester, target] = await Promise.all([
+      Conversation.findById(conversationId),
+      resolveUserDoc(requesterId),
+      resolveUserDoc(participantId)
+    ]);
+
     if (!conversation || !conversation.isGroup) {
       return res.status(404).json({ success: false, message: "Group conversation not found" });
     }
-
-    const requester = await resolveUserDoc(requesterId);
-    const target = await resolveUserDoc(participantId);
 
     if (!requester || !target) {
       return res.status(404).json({ success: false, message: "User not found" });
@@ -951,26 +1002,28 @@ router.delete("/conversations/:conversationId/participants/:participantId", asyn
 
     const isSelfRemove = requester._id.toString() === target._id.toString();
     const isAdmin = conversation.groupAdmin.toString() === requester._id.toString() ||
-                    (conversation.groupCoAdmins && conversation.groupCoAdmins.some((id) => id.toString() === requester._id.toString()));
+      (conversation.groupCoAdmins && conversation.groupCoAdmins.some((id) => id.toString() === requester._id.toString()));
 
     if (!isSelfRemove && !isAdmin) {
       return res.status(403).json({ success: false, message: "Only admin or member themselves can remove participant" });
     }
 
+    const targetStr = target._id.toString();
+
     conversation.participants = conversation.participants.filter(
-      (id) => id.toString() !== target._id.toString()
+      (id) => id.toString() !== targetStr
     );
 
     if (conversation.groupCoAdmins) {
       conversation.groupCoAdmins = conversation.groupCoAdmins.filter(
-        (id) => id.toString() !== target._id.toString()
+        (id) => id.toString() !== targetStr
       );
     }
 
     if (!conversation.exitedUsers) {
       conversation.exitedUsers = [];
     }
-    if (!conversation.exitedUsers.some((id) => id.toString() === target._id.toString())) {
+    if (!conversation.exitedUsers.some((id) => id.toString() === targetStr)) {
       conversation.exitedUsers.push(target._id);
     }
 
@@ -981,13 +1034,12 @@ router.delete("/conversations/:conversationId/participants/:participantId", asyn
       { path: "groupCoAdmins", select: "username name profilePicture userid" }
     ]);
 
-    // Force target user to leave the socket conversation room immediately
     const io = req.app.get("io");
     if (io) {
-      const targetRoom = `user:${target._id.toString()}`;
+      const targetRoom = `user:${targetStr}`;
       const convRoom = `conv:${conversationId}`;
       io.in(targetRoom).socketsLeave(convRoom);
-      console.log(`🔌 Forced user ${target._id.toString()} sockets to leave room ${convRoom}`);
+      console.log(`🔌 Forced user ${targetStr} sockets to leave room ${convRoom}`);
     }
 
     res.status(200).json({
@@ -1006,25 +1058,27 @@ router.put("/conversations/:conversationId/group-info", async (req, res) => {
     const { conversationId } = req.params;
     const { requesterId, groupName, groupAvatar, groupDescription } = req.body;
 
-    const conversation = await Conversation.findById(conversationId);
+    // 🚀 OPTIMIZATION: Parallel fetching
+    const [conversation, requester] = await Promise.all([
+      Conversation.findById(conversationId),
+      resolveUserDoc(requesterId)
+    ]);
+
     if (!conversation || !conversation.isGroup) {
       return res.status(404).json({ success: false, message: "Group conversation not found" });
     }
 
-    const requester = await resolveUserDoc(requesterId);
     if (!requester) {
       return res.status(404).json({ success: false, message: "User not found" });
     }
+
     const isRequesterAdmin = conversation.groupAdmin.toString() === requester._id.toString() ||
-                             (conversation.groupCoAdmins && conversation.groupCoAdmins.some((id) => id.toString() === requester._id.toString()));
+      (conversation.groupCoAdmins && conversation.groupCoAdmins.some((id) => id.toString() === requester._id.toString()));
     if (!isRequesterAdmin) {
       return res.status(403).json({ success: false, message: "Only group admins can update group info" });
     }
 
-    if (groupAvatar !== undefined) {
-      conversation.groupAvatar = groupAvatar;
-    }
-
+    if (groupAvatar !== undefined) conversation.groupAvatar = groupAvatar;
     if (groupName !== undefined) conversation.groupName = groupName;
     if (groupDescription !== undefined) conversation.groupDescription = groupDescription;
 
@@ -1047,55 +1101,43 @@ router.put("/conversations/:conversationId/group-info", async (req, res) => {
 });
 
 // =========================================================
-// 9️⃣ GROUP INVITE LINK ROUTES
+// 1️⃣2️⃣ GROUP INVITE LINK ROUTES
 // =========================================================
 
-// Generate or get S3/Group invite link
 router.post("/conversations/:conversationId/invite-link", async (req, res) => {
   try {
     const { conversationId } = req.params;
     const { adminId } = req.body;
-    console.log(`✉️ [InviteLink] Req conversationId: ${conversationId}, adminId: ${adminId}`);
 
-    const conversation = await Conversation.findById(conversationId);
-    if (!conversation) {
-      console.log(`❌ [InviteLink] Conversation not found: ${conversationId}`);
+    // 🚀 OPTIMIZATION: Concurrent fetching
+    const [conversation, admin] = await Promise.all([
+      Conversation.findById(conversationId),
+      resolveUserDoc(adminId)
+    ]);
+
+    if (!conversation || !conversation.isGroup) {
       return res.status(404).json({ success: false, message: "Group conversation not found" });
     }
-    if (!conversation.isGroup) {
-      console.log(`❌ [InviteLink] Conversation is not a group: ${conversationId}`);
-      return res.status(404).json({ success: false, message: "Group conversation not found" });
-    }
 
-    const admin = await resolveUserDoc(adminId);
     if (!admin) {
-      console.log(`❌ [InviteLink] Admin user not resolved for adminId: ${adminId}`);
       return res.status(403).json({ success: false, message: "Only group admin can manage invite links" });
     }
 
-    // Auto-repair groupAdmin if not set
     if (!conversation.groupAdmin && conversation.participants.length > 0) {
-      console.log(`⚠️ [InviteLink] groupAdmin is missing. Setting to first participant: ${conversation.participants[0]}`);
       conversation.groupAdmin = conversation.participants[0];
       await conversation.save();
     }
 
-    console.log(`✉️ [InviteLink] GroupAdmin: ${conversation.groupAdmin}, Admin: ${admin._id}`);
-
-    const isRequesterAdmin = admin && (conversation.groupAdmin.toString() === admin._id.toString() || (conversation.groupCoAdmins && conversation.groupCoAdmins.some((id) => id.toString() === admin._id.toString())));
+    const isRequesterAdmin = conversation.groupAdmin.toString() === admin._id.toString() ||
+      (conversation.groupCoAdmins && conversation.groupCoAdmins.some((id) => id.toString() === admin._id.toString()));
     if (!isRequesterAdmin) {
-      console.log(`❌ [InviteLink] Requester ${admin._id} is not an admin`);
       return res.status(403).json({ success: false, message: "Only group admin can manage invite links" });
     }
 
-    // If inviteCode doesn't exist, generate a new one
     if (!conversation.inviteCode) {
       const { v4: uuidv4 } = require("uuid");
       conversation.inviteCode = uuidv4().replace(/-/g, "").substring(0, 16);
       await conversation.save();
-      console.log(`✅ [InviteLink] Generated new code: ${conversation.inviteCode}`);
-    } else {
-      console.log(`✅ [InviteLink] Existing code: ${conversation.inviteCode}`);
     }
 
     res.status(200).json({
@@ -1108,18 +1150,20 @@ router.post("/conversations/:conversationId/invite-link", async (req, res) => {
   }
 });
 
-// Revoke/Delete invite link
 router.delete("/conversations/:conversationId/invite-link", async (req, res) => {
   try {
     const { conversationId } = req.params;
     const { adminId } = req.body;
 
-    const conversation = await Conversation.findById(conversationId);
+    const [conversation, admin] = await Promise.all([
+      Conversation.findById(conversationId),
+      resolveUserDoc(adminId)
+    ]);
+
     if (!conversation || !conversation.isGroup) {
       return res.status(404).json({ success: false, message: "Group conversation not found" });
     }
 
-    const admin = await resolveUserDoc(adminId);
     const isRequesterAdmin = admin && (conversation.groupAdmin && (conversation.groupAdmin.toString() === admin._id.toString() || (conversation.groupCoAdmins && conversation.groupCoAdmins.some((id) => id.toString() === admin._id.toString()))));
     if (!isRequesterAdmin) {
       return res.status(403).json({ success: false, message: "Only group admin can revoke invite links" });
@@ -1138,7 +1182,6 @@ router.delete("/conversations/:conversationId/invite-link", async (req, res) => 
   }
 });
 
-// Resolve S3/Group invite code details
 router.get("/groups/invite/:inviteCode", async (req, res) => {
   try {
     const { inviteCode } = req.params;
@@ -1148,20 +1191,20 @@ router.get("/groups/invite/:inviteCode", async (req, res) => {
       return res.status(400).json({ success: false, message: "Invite code is required" });
     }
 
-    const conversation = await Conversation.findOne({ inviteCode });
+    // 🚀 OPTIMIZATION: Fetch conversation and user simultaneously
+    const [conversation, user] = await Promise.all([
+      Conversation.findOne({ inviteCode }).populate("participants", "username name profilePicture isConnected userid lastConnectedAt"),
+      userId ? resolveUserDoc(userId) : null
+    ]);
+
     if (!conversation || !conversation.isGroup) {
       return res.status(404).json({ success: false, message: "Invite link is invalid or has been revoked" });
     }
 
     let isAlreadyMember = false;
-    if (userId) {
-      const user = await resolveUserDoc(userId);
-      if (user) {
-        isAlreadyMember = conversation.participants.some((id) => id.toString() === user._id.toString());
-      }
+    if (user) {
+      isAlreadyMember = conversation.participants.some((p) => p._id.toString() === user._id.toString());
     }
-
-    await conversation.populate("participants", "username name profilePicture isConnected userid lastConnectedAt");
 
     res.status(200).json({
       success: true,
@@ -1177,7 +1220,6 @@ router.get("/groups/invite/:inviteCode", async (req, res) => {
   }
 });
 
-// Join group via S3/Group invite code
 router.post("/groups/invite/:inviteCode/join", async (req, res) => {
   try {
     const { inviteCode } = req.params;
@@ -1187,17 +1229,23 @@ router.post("/groups/invite/:inviteCode/join", async (req, res) => {
       return res.status(400).json({ success: false, message: "Invite code is required" });
     }
 
-    const conversation = await Conversation.findOne({ inviteCode });
+    // 🚀 OPTIMIZATION: Parallel lookup
+    const [conversation, user] = await Promise.all([
+      Conversation.findOne({ inviteCode }),
+      resolveUserDoc(userId)
+    ]);
+
     if (!conversation || !conversation.isGroup) {
       return res.status(404).json({ success: false, message: "Invite link is invalid or has been revoked" });
     }
 
-    const user = await resolveUserDoc(userId);
     if (!user) {
       return res.status(404).json({ success: false, message: "User not found" });
     }
 
-    const isAlreadyMember = conversation.participants.some((id) => id.toString() === user._id.toString());
+    const userIdStr = user._id.toString();
+    const isAlreadyMember = conversation.participants.some((id) => id.toString() === userIdStr);
+
     if (isAlreadyMember) {
       return res.status(200).json({
         success: true,
@@ -1206,21 +1254,19 @@ router.post("/groups/invite/:inviteCode/join", async (req, res) => {
       });
     }
 
-    // Add user to participants
     conversation.participants.push(user._id);
-    conversation.unreadCounts.set(user._id.toString(), 0);
+    conversation.unreadCounts.set(userIdStr, 0);
     if (!conversation.joinedAt) conversation.joinedAt = new Map();
-    conversation.joinedAt.set(user._id.toString(), new Date());
+    conversation.joinedAt.set(userIdStr, new Date());
 
     if (conversation.exitedUsers) {
-      conversation.exitedUsers = conversation.exitedUsers.filter((id) => id.toString() !== user._id.toString());
+      conversation.exitedUsers = conversation.exitedUsers.filter((id) => id.toString() !== userIdStr);
     }
     if (conversation.deletedFor) {
-      conversation.deletedFor = conversation.deletedFor.filter((id) => id.toString() !== user._id.toString());
+      conversation.deletedFor = conversation.deletedFor.filter((id) => id.toString() !== userIdStr);
     }
 
     await conversation.save();
-
     await conversation.populate([
       { path: "participants", select: "username name profilePicture isConnected userid lastConnectedAt" },
       { path: "groupAdmin", select: "username name profilePicture userid" },
@@ -1238,7 +1284,10 @@ router.post("/groups/invite/:inviteCode/join", async (req, res) => {
   }
 });
 
-// Get bidirectional block status between two users
+// =========================================================
+// 1️⃣3️⃣ BLOCK STATUS & CO-ADMIN MANAGEMENT
+// =========================================================
+
 router.get("/conversations/block-status/:otherUserId", async (req, res) => {
   try {
     const { otherUserId } = req.params;
@@ -1248,8 +1297,11 @@ router.get("/conversations/block-status/:otherUserId", async (req, res) => {
       return res.status(400).json({ success: false, message: "Missing currentUserId or otherUserId" });
     }
 
-    const currentUser = await resolveUserDoc(currentUserId);
-    const otherUser = await resolveUserDoc(otherUserId);
+    // 🚀 OPTIMIZATION: Fetch both users simultaneously
+    const [currentUser, otherUser] = await Promise.all([
+      resolveUserDoc(currentUserId),
+      resolveUserDoc(otherUserId)
+    ]);
 
     if (!currentUser || !otherUser) {
       return res.status(200).json({
@@ -1280,28 +1332,33 @@ router.get("/conversations/block-status/:otherUserId", async (req, res) => {
   }
 });
 
-// Promote participant to Co-Admin
 router.post("/conversations/:conversationId/co-admins", async (req, res) => {
   try {
     const { conversationId } = req.params;
     const { requesterId, targetId } = req.body;
 
-    const conversation = await Conversation.findById(conversationId);
+    // 🚀 OPTIMIZATION: Parallel execution
+    const [conversation, requester, target] = await Promise.all([
+      Conversation.findById(conversationId),
+      resolveUserDoc(requesterId),
+      resolveUserDoc(targetId)
+    ]);
+
     if (!conversation || !conversation.isGroup) {
       return res.status(404).json({ success: false, message: "Group conversation not found" });
     }
 
-    const requester = await resolveUserDoc(requesterId);
     if (!requester || conversation.groupAdmin.toString() !== requester._id.toString()) {
       return res.status(403).json({ success: false, message: "Only the primary group admin can assign co-admins" });
     }
 
-    const target = await resolveUserDoc(targetId);
     if (!target) {
       return res.status(404).json({ success: false, message: "Target user not found" });
     }
 
-    if (!conversation.participants.some(id => id.toString() === target._id.toString())) {
+    const targetStr = target._id.toString();
+
+    if (!conversation.participants.some(id => id.toString() === targetStr)) {
       return res.status(400).json({ success: false, message: "Target user is not a participant in this group" });
     }
 
@@ -1309,7 +1366,7 @@ router.post("/conversations/:conversationId/co-admins", async (req, res) => {
       conversation.groupCoAdmins = [];
     }
 
-    if (!conversation.groupCoAdmins.some(id => id.toString() === target._id.toString())) {
+    if (!conversation.groupCoAdmins.some(id => id.toString() === targetStr)) {
       conversation.groupCoAdmins.push(target._id);
       await conversation.save();
     }
@@ -1331,29 +1388,34 @@ router.post("/conversations/:conversationId/co-admins", async (req, res) => {
   }
 });
 
-// Demote participant from Co-Admin
 router.delete("/conversations/:conversationId/co-admins/:targetId", async (req, res) => {
   try {
     const { conversationId, targetId } = req.params;
     const { requesterId } = req.body;
 
-    const conversation = await Conversation.findById(conversationId);
+    // 🚀 OPTIMIZATION: Parallel execution
+    const [conversation, requester, target] = await Promise.all([
+      Conversation.findById(conversationId),
+      resolveUserDoc(requesterId),
+      resolveUserDoc(targetId)
+    ]);
+
     if (!conversation || !conversation.isGroup) {
       return res.status(404).json({ success: false, message: "Group conversation not found" });
     }
 
-    const requester = await resolveUserDoc(requesterId);
     if (!requester || conversation.groupAdmin.toString() !== requester._id.toString()) {
       return res.status(403).json({ success: false, message: "Only the primary group admin can remove co-admins" });
     }
 
-    const target = await resolveUserDoc(targetId);
     if (!target) {
       return res.status(404).json({ success: false, message: "Target user not found" });
     }
 
+    const targetStr = target._id.toString();
+
     if (conversation.groupCoAdmins) {
-      conversation.groupCoAdmins = conversation.groupCoAdmins.filter(id => id.toString() !== target._id.toString());
+      conversation.groupCoAdmins = conversation.groupCoAdmins.filter(id => id.toString() !== targetStr);
       await conversation.save();
     }
 

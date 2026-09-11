@@ -6,6 +6,7 @@ const ReelInteraction = require("../models/ReelInteraction");
 const logUserAction = require("../utils/logUserAction");
 
 
+// 1️⃣ BLOCK USER API (SUPERFAST)
 router.post("/block-user", async (req, res) => {
   try {
     const { blockerId, targetUserId } = req.body;
@@ -18,16 +19,19 @@ router.post("/block-user", async (req, res) => {
       return res.status(400).json({ success: false, message: "You cannot block yourself." });
     }
 
-    // Find both users in the database
-    const blocker = await User.findById(blockerId);
-    const target = await User.findById(targetUserId);
+    // 🚀 OPTIMIZATION 1: Fetch both users in PARALLEL (Same time pe)
+    const [blocker, target] = await Promise.all([
+      User.findById(blockerId),
+      User.findById(targetUserId)
+    ]);
 
     if (!blocker || !target) {
       return res.status(404).json({ success: false, message: "User not found." });
     }
 
-    // Check if already blocked
-    if (blocker.blockedUsers.includes(targetUserId)) {
+    // Safe ObjectId string comparison
+    const isAlreadyBlocked = blocker.blockedUsers.some(id => id.toString() === targetUserId.toString());
+    if (isAlreadyBlocked) {
       return res.status(400).json({ success: false, message: "User is already blocked." });
     }
 
@@ -35,17 +39,14 @@ router.post("/block-user", async (req, res) => {
     blocker.blockedUsers.push(targetUserId);
 
     // 2. Mutual Unfollow (Instagram style)
-    // Remove target from blocker's following and followers
-    blocker.following = blocker.following.filter(id => id.toString() !== targetUserId);
-    blocker.followers = blocker.followers.filter(id => id.toString() !== targetUserId);
+    blocker.following = blocker.following.filter(id => id.toString() !== targetUserId.toString());
+    blocker.followers = blocker.followers.filter(id => id.toString() !== targetUserId.toString());
 
-    // Remove blocker from target's following and followers
-    target.following = target.following.filter(id => id.toString() !== blockerId);
-    target.followers = target.followers.filter(id => id.toString() !== blockerId);
+    target.following = target.following.filter(id => id.toString() !== blockerId.toString());
+    target.followers = target.followers.filter(id => id.toString() !== blockerId.toString());
 
-    // Save both changes
-    await blocker.save();
-    await target.save();
+    // 🚀 OPTIMIZATION 2: Save both user documents in PARALLEL (Ek sath save honge)
+    await Promise.all([blocker.save(), target.save()]);
 
     res.status(200).json({
       success: true,
@@ -59,6 +60,7 @@ router.post("/block-user", async (req, res) => {
 });
 
 
+// 2️⃣ UNBLOCK USER API (SUPERFAST)
 router.post("/unblock-user", async (req, res) => {
   try {
     const { unblockerId, targetUserId } = req.body;
@@ -71,23 +73,26 @@ router.post("/unblock-user", async (req, res) => {
       return res.status(400).json({ success: false, message: "You cannot unblock yourself." });
     }
 
-    // Find the users in the database
-    const unblocker = await User.findById(unblockerId);
-    const target = await User.findById(targetUserId);
+    // 🚀 OPTIMIZATION 1: Fetch unblocker (Full doc) and target (Only username needed) in PARALLEL
+    const [unblocker, target] = await Promise.all([
+      User.findById(unblockerId),
+      User.findById(targetUserId).select("username").lean() // Target me bas username chahiye toh sirf wahi fetch kiya
+    ]);
 
     if (!unblocker || !target) {
       return res.status(404).json({ success: false, message: "User not found." });
     }
 
-    // Check if the target user is actually in the blocked list
-    if (!unblocker.blockedUsers.includes(targetUserId)) {
+    // Check if target is blocked
+    const isBlocked = unblocker.blockedUsers.some(id => id.toString() === targetUserId.toString());
+    if (!isBlocked) {
       return res.status(400).json({ success: false, message: "User is not currently blocked." });
     }
 
-    // Remove the target user from the blocked list
-    unblocker.blockedUsers = unblocker.blockedUsers.filter(id => id.toString() !== targetUserId);
+    // Remove from blocked list
+    unblocker.blockedUsers = unblocker.blockedUsers.filter(id => id.toString() !== targetUserId.toString());
 
-    // Save the changes
+    // Save unblocker
     await unblocker.save();
 
     res.status(200).json({
@@ -102,11 +107,16 @@ router.post("/unblock-user", async (req, res) => {
 });
 
 
+// 3️⃣ GET BLOCKED USERS API (SUPERFAST)
 router.get("/blocked-users/:id", async (req, res) => {
   try {
     const { id } = req.params;
 
-    // 🚀 OPTIMIZATION: .lean() and strict .select() to prevent fetching huge extra data
+    // 🚀 OPTIMIZATION: Early ObjectId validation (Fail Fast - bina database jaye hi invalid ID reject ho jayegi)
+    if (!mongoose.isValidObjectId(id)) {
+      return res.status(400).json({ success: false, message: "Invalid user ID" });
+    }
+
     const user = await User.findById(id)
       .select("blockedUsers")
       .populate({

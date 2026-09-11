@@ -39,6 +39,8 @@ const reelSchema = new mongoose.Schema(
     },
 
     caption: { type: String },
+    captionTime: { type: Date },
+    captionUpdatedAt: { type: Date },
     category: { type: String },
     description: { type: String },
     duration: { type: Number },
@@ -73,10 +75,18 @@ const reelSchema = new mongoose.Schema(
   { timestamps: true },
 );
 
-// ================= AUTO SYNC USER DATA =================
+// ================= AUTO SYNC USER DATA & CAPTION TIME =================
 
 reelSchema.pre("save", async function (next) {
   try {
+    if (this.isModified("caption") && this.caption) {
+      const now = new Date();
+      if (!this.captionTime) {
+        this.captionTime = now;
+      }
+      this.captionUpdatedAt = now;
+    }
+
     if (!this.isModified("user") && !this.isNew) return next();
 
     const User = mongoose.model("User4");

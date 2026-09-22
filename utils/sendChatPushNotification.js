@@ -1,5 +1,6 @@
 const axios = require("axios");
 const User = require("../models/Users");
+const Message = require("../models/Message");
 
 /**
  * Sends a push notification for chat messages via welfog production API.
@@ -8,6 +9,7 @@ const sendChatPushNotification = async ({
   conversation,
   senderDoc,
   messageDoc,
+  io,
 }) => {
   try {
     const senderName = senderDoc.name || senderDoc.username || "Someone";
@@ -85,6 +87,7 @@ const sendChatPushNotification = async ({
             senderUserId: senderDoc.userid || senderDoc._id.toString(),
             play_type: isGroup ? "group_chat" : "chat",
             conversationId: conversation._id.toString(),
+            messageId: messageDoc._id.toString(),
             targetUserId: senderDoc.userid || senderDoc._id.toString(),
             senderName: senderName,
             text: textContent,
@@ -99,6 +102,9 @@ const sendChatPushNotification = async ({
         console.log(`Sending chat push notification payload to user_id ${rawUserId}:`, JSON.stringify(payload, null, 2));
 
         axios.post("https://welfogapi.welfog.com/api/notifications", payload)
+          .then((res) => {
+            console.log(`✅ Push notification dispatched to user_id ${rawUserId}, status: ${res.status}`);
+          })
           .catch((err) => {
             console.error(`Failed to send chat push notification to api for user ${rawUserId}:`, err.message);
           });

@@ -570,16 +570,17 @@ router.post("/conversations/:conversationId/messages", async (req, res) => {
     const messageData = newMessage.toObject();
     if (tempId) messageData.tempId = tempId;
 
+    const io = req.app.get("io");
+
     // Trigger push notifications
     try {
       const sendChatPushNotification = require("../utils/sendChatPushNotification");
-      sendChatPushNotification({ conversation, senderDoc, messageDoc: newMessage }); // Fire and forget
+      sendChatPushNotification({ conversation, senderDoc, messageDoc: newMessage, io }); // Fire and forget
     } catch (err) {
       console.error("❌ Failed to trigger chat push notification:", err.message);
     }
 
     // Socket Emissions (Instant)
-    const io = req.app.get("io");
     if (io) {
       if (isReceiverBlocked) {
         io.to(`user:${senderIdStr}`).emit("new_message", messageData);
@@ -613,6 +614,218 @@ router.post("/conversations/:conversationId/messages", async (req, res) => {
   } catch (error) {
     console.error("Error sending message:", error);
     res.status(500).json({ success: false, message: "Failed to send message" });
+  }
+});
+
+// =========================================================
+// 6.5️⃣ MARK MESSAGE DELIVERED (REST API Endpoint for Background Delivery ACK)
+// =========================================================
+router.post("/messages/delivered", async (req, res) => {
+  try {
+    const { messageId, conversationId, userId } = req.body;
+
+    if (!messageId || !userId) {
+      return res.status(400).json({ success: false, message: "messageId and userId are required" });
+    }
+
+    const [userDoc, messageDoc] = await Promise.all([
+      resolveUserDoc(userId),
+      Message.findById(messageId)
+    ]);
+
+    if (!userDoc || !messageDoc) {
+      return res.status(404).json({ success: false, message: "User or Message not found" });
+    }
+
+    const userIdObj = userDoc._id;
+    const userIdStr = userIdObj.toString();
+
+    const alreadyDelivered = messageDoc.deliveredTo.some((id) => id.toString() === userIdStr);
+
+    if (!alreadyDelivered) {
+      messageDoc.deliveredTo.push(userIdObj);
+      if (messageDoc.status === "sent") {
+        messageDoc.status = "delivered";
+      }
+      await messageDoc.save();
+
+      const io = req.app.get("io");
+      const payload = {
+        messageId: messageDoc._id.toString(),
+        conversationId: (messageDoc.conversation || conversationId).toString(),
+        userId: userIdStr,
+        customUserId: userDoc.userid || userIdStr,
+        status: messageDoc.status,
+      };
+
+      if (io) {
+        const convRoom = (messageDoc.conversation || conversationId).toString();
+        const senderStr = messageDoc.sender.toString();
+        io.to(`conv:${convRoom}`).emit("message_delivered", payload);
+        io.to(`user:${senderStr}`).emit("message_delivered", payload);
+
+        const messageData = messageDoc.toObject ? messageDoc.toObject() : messageDoc;
+        io.to(`user:${senderStr}`).emit("conversation_updated", {
+          conversationId: convRoom,
+          lastMessage: messageData,
+          updatedAt: new Date(),
+        });
+      }
+
+      return res.status(200).json({
+        success: true,
+        message: "Message marked as delivered",
+        data: payload,
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "Message was already marked as delivered",
+      status: messageDoc.status,
+    });
+  } catch (error) {
+    console.error("Error in /messages/delivered endpoint:", error);
+    res.status(500).json({ success: false, message: "Failed to mark message as delivered" });
+  }
+});
+
+router.post("/mark-delivered", async (req, res) => {
+  try {
+    const { messageId, conversationId, userId } = req.body;
+
+    if (!messageId || !userId) {
+      return res.status(400).json({ success: false, message: "messageId and userId are required" });
+    }
+
+    const [userDoc, messageDoc] = await Promise.all([
+      resolveUserDoc(userId),
+      Message.findById(messageId)
+    ]);
+
+    if (!userDoc || !messageDoc) {
+      return res.status(404).json({ success: false, message: "User or Message not found" });
+    }
+
+    const userIdObj = userDoc._id;
+    const userIdStr = userIdObj.toString();
+
+    const alreadyDelivered = messageDoc.deliveredTo.some((id) => id.toString() === userIdStr);
+
+    if (!alreadyDelivered) {
+      messageDoc.deliveredTo.push(userIdObj);
+      if (messageDoc.status === "sent") {
+        messageDoc.status = "delivered";
+      }
+      await messageDoc.save();
+
+      const io = req.app.get("io");
+      const payload = {
+        messageId: messageDoc._id.toString(),
+        conversationId: (messageDoc.conversation || conversationId).toString(),
+        userId: userIdStr,
+        customUserId: userDoc.userid || userIdStr,
+        status: messageDoc.status,
+      };
+
+      if (io) {
+        const convRoom = (messageDoc.conversation || conversationId).toString();
+        const senderStr = messageDoc.sender.toString();
+        io.to(`conv:${convRoom}`).emit("message_delivered", payload);
+        io.to(`user:${senderStr}`).emit("message_delivered", payload);
+
+        const messageData = messageDoc.toObject ? messageDoc.toObject() : messageDoc;
+        io.to(`user:${senderStr}`).emit("conversation_updated", {
+          conversationId: convRoom,
+          lastMessage: messageData,
+          updatedAt: new Date(),
+        });
+      }
+
+      return res.status(200).json({
+        success: true,
+        message: "Message marked as delivered",
+        data: payload,
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "Message was already marked as delivered",
+      status: messageDoc.status,
+    });
+  } catch (error) {
+    console.error("Error in /mark-delivered endpoint:", error);
+    res.status(500).json({ success: false, message: "Failed to mark message as delivered" });
+  }
+});
+
+router.post("/conversations/:conversationId/delivered", async (req, res) => {
+  try {
+    const { conversationId } = req.params;
+    const { userId, messageId } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({ success: false, message: "userId is required" });
+    }
+
+    const userDoc = await resolveUserDoc(userId);
+    if (!userDoc) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    const userIdObj = userDoc._id;
+    const userIdStr = userIdObj.toString();
+
+    const query = { conversation: conversationId };
+    if (messageId && mongoose.isValidObjectId(messageId)) {
+      query._id = messageId;
+    } else {
+      query.sender = { $ne: userIdObj };
+      query.deliveredTo = { $ne: userIdObj };
+    }
+
+    const messagesToUpdate = await Message.find(query);
+
+    if (messagesToUpdate.length > 0) {
+      await Message.updateMany(query, {
+        $addToSet: { deliveredTo: userIdObj },
+        $set: { status: "delivered" }
+      });
+
+      const io = req.app.get("io");
+      if (io) {
+        messagesToUpdate.forEach((msg) => {
+          const payload = {
+            messageId: msg._id.toString(),
+            conversationId: conversationId.toString(),
+            userId: userIdStr,
+            customUserId: userDoc.userid || userIdStr,
+            status: "delivered",
+          };
+          const senderStr = msg.sender.toString();
+          io.to(`conv:${conversationId}`).emit("message_delivered", payload);
+          io.to(`user:${senderStr}`).emit("message_delivered", payload);
+
+          const messageData = msg.toObject ? msg.toObject() : msg;
+          messageData.status = "delivered";
+          io.to(`user:${senderStr}`).emit("conversation_updated", {
+            conversationId,
+            lastMessage: messageData,
+            updatedAt: new Date(),
+          });
+        });
+      }
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "Messages marked as delivered",
+      updatedCount: messagesToUpdate.length,
+    });
+  } catch (error) {
+    console.error("Error in /conversations/:conversationId/delivered endpoint:", error);
+    res.status(500).json({ success: false, message: "Failed to mark messages as delivered" });
   }
 });
 // =========================================================

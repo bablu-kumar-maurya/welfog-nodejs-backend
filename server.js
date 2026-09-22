@@ -45,6 +45,10 @@ app.use(cookieParser());
 const allowedOrigins = [
   "http://localhost:5173",
   "http://localhost:3000",
+  "http://localhost:3001",
+  "http://127.0.0.1:3001",
+  "http://127.0.0.1:3000",
+  "http://127.0.0.1:5173",
   "http://127.0.0.1:5500",
   "http://localhost:5500",
   "null",
@@ -135,6 +139,11 @@ const requireDeviceId = (req, res, next) => {
 
   if (isPublicShareRoute(req)) {
     console.log(`✅ [DeviceAuth] Public share route bypassed.`);
+    return next();
+  }
+
+  if (req.path.includes("/delivered") || req.path.includes("/mark-delivered")) {
+    console.log(`✅ [DeviceAuth] Delivery ACK path bypassed.`);
     return next();
   }
 
@@ -252,6 +261,9 @@ const suspendRoutes = require("./routes/suspendRoutes");
 const uploadRoute = require("./routes/uploadRoute");
 const userblockRoute = require("./routes/userblockRoute");
 const chatRoutes = require("./routes/chatRoutes");
+const likeRoutes = require("./routes/likeRoutes");
+const viewRoutes = require("./routes/viewRoutes");
+const rewardRoutes = require("./routes/rewardRoutes");
 
 console.log("🛤️ Mounting Routes...");
 app.use("/api/users", userRoutes);
@@ -266,6 +278,9 @@ app.use("/api/suspend", suspendRoutes);
 app.use("/api/uploads", uploadRoute);
 app.use("/api/userblocks", userblockRoute);
 app.use("/api/chat", chatRoutes);
+app.use("/api/likes", likeRoutes);
+app.use("/api/views", viewRoutes);
+app.use("/api/rewards", rewardRoutes);
 console.log("✅ All routes mounted.");
 
 app.get("/", (req, res) => {

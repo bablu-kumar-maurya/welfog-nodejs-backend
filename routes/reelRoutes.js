@@ -17,6 +17,9 @@ const createNotification = require("../utils/createNotification");
 const logError = require("../utils/logError");
 const { generateShortLink } = require("../utils/shortLink");
 const ReelInteraction = require('../models/ReelInteraction');
+const LikeTracking = require("../models/LikeTracking");
+const ViewTracking = require("../models/ViewTracking");
+const rewardService = require("../services/rewardService");
 
 // ===== NEW: REDIS & QUEUE SETUP =====
 console.log("🔄 [ROUTER] Setting up Redis Queue connection...");
@@ -830,9 +833,53 @@ router.post("/view", async (req, res) => {
             return res.status(200).json({ message: "View already counted" });
         }
 
+        // 🎯 WALLET & MILESTONE REWARD INTEGRATION (70% Watch Validation & Milestone Credit)
+        let rewardResult = null;
+        try {
+            const { watchPercentage, watchedDuration, videoDuration, sessionId } = req.body;
+            let qualifiesForReward = true;
+
+            if (watchPercentage !== undefined && watchPercentage !== null && !isNaN(Number(watchPercentage))) {
+                qualifiesForReward = Number(watchPercentage) >= 70;
+            } else if (watchedDuration && videoDuration && Number(videoDuration) > 0) {
+                qualifiesForReward = (Number(watchedDuration) / Number(videoDuration)) * 100 >= 70;
+            }
+
+            if (qualifiesForReward && currentReel.user) {
+                // Record View tracking
+                const activeSessionId = sessionId || `view_${user._id}_${Date.now()}`;
+                try {
+                    await ViewTracking.create({
+                        user: user._id,
+                        userId: user.userid || "",
+                        reel: reelId,
+                        sessionId: activeSessionId,
+                        watchPercentage: 100,
+                        viewedAt: new Date(),
+                    });
+                } catch (vtErr) {}
+
+                // Process Milestone Reward for Creator
+                rewardResult = await rewardService.processMilestoneReward({
+                    reelId,
+                    creatorId: currentReel.user,
+                    currentCount: updated.views,
+                    type: "VIEW",
+                });
+            }
+        } catch (rewardErr) {
+            console.error("View milestone reward error:", rewardErr.message);
+        }
+
         return res.status(200).json({
             message: "View added",
             views: updated.views,
+            reward: rewardResult ? {
+                earned: rewardResult.earned,
+                alreadyAwarded: rewardResult.alreadyAwarded,
+                coins: rewardResult.coins,
+                milestone: rewardResult.milestone,
+            } : null,
         });
     } catch (error) {
         console.error("Error incrementing reel view:", error);
@@ -1445,16 +1492,49 @@ router.put("/like/:id", async (req, res) => {
             console.log("👉 UNLIKE FLOW");
             reel.likes = reel.likes.filter(id => id.toString() !== user._id.toString());
             await reel.save();
+
+            // Record LikeTracking
+            try {
+                await LikeTracking.findOneAndUpdate(
+                    { user: user._id, reel: reel._id },
+                    { $set: { userId: user.userid, status: "UNLIKED", lastUnlikedAt: new Date() } },
+                    { upsert: true }
+                );
+            } catch (ltErr) {}
+
+            const milestoneStatus = await rewardService.getMilestoneStatus({
+                reelId: reel._id,
+                currentCount: reel.likes.length,
+                type: "LIKE",
+            });
+
             console.log("Returning Response: Reel unliked");
             return res.status(200).json({
                 message: "Reel unliked",
-                likes: reel.likes.length
+                likes: reel.likes.length,
+                liked: false,
+                alreadyLiked: false,
+                reward: {
+                    earned: false,
+                    alreadyAwarded: milestoneStatus.alreadyAwarded,
+                    coins: 0,
+                    milestone: milestoneStatus.milestone,
+                },
             });
 
         } else {
             // ❤️ LIKE
             reel.likes.push(user._id);
             await reel.save();
+
+            // Record LikeTracking
+            try {
+                await LikeTracking.findOneAndUpdate(
+                    { user: user._id, reel: reel._id },
+                    { $set: { userId: user.userid, status: "LIKED", lastLikedAt: new Date() } },
+                    { upsert: true }
+                );
+            } catch (ltErr) {}
 
             // 🔔 CREATE LIKE NOTIFICATION
             console.log("========== NOTIFICATION ==========");
@@ -1480,11 +1560,33 @@ router.put("/like/:id", async (req, res) => {
             } catch (notifError) {
                 console.error("Like notification failed:", notifError.message);
             }
+
+            // 🎯 WALLET & MILESTONE REWARD INTEGRATION
+            let rewardResult = null;
+            try {
+                rewardResult = await rewardService.processMilestoneReward({
+                    reelId: reel._id,
+                    creatorId: reel.user,
+                    currentCount: reel.likes.length,
+                    type: "LIKE",
+                });
+            } catch (rErr) {
+                console.error("Like milestone reward error:", rErr.message);
+            }
+
             console.log("Returning Response: Reel liked");
 
             return res.status(200).json({
                 message: "Reel liked",
-                likes: reel.likes.length
+                likes: reel.likes.length,
+                liked: true,
+                alreadyLiked: false,
+                reward: rewardResult ? {
+                    earned: rewardResult.earned,
+                    alreadyAwarded: rewardResult.alreadyAwarded,
+                    coins: rewardResult.coins,
+                    milestone: rewardResult.milestone,
+                } : null,
             });
         }
 

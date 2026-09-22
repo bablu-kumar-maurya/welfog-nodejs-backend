@@ -15,7 +15,8 @@ import {
   MdExpandMore,
   MdExpandLess,
   MdGroupWork,
-   MdBugReport 
+  MdBugReport,
+  MdAccountBalanceWallet
 } from 'react-icons/md';
 
 import { useAuth } from '../context/AuthContext';
@@ -40,6 +41,7 @@ const Sidebar = () => {
     { path: '/music', icon: MdMusicNote, label: 'Music' },
     { path: '/comments', icon: MdComment, label: 'Comments' },
     { path: '/notifications', icon: MdNotifications, label: 'Notifications' },
+    { path: '/rewards', icon: MdAccountBalanceWallet, label: 'Wallet & Rewards' },
     { path: '/activity-logs', icon: MdHistory, label: 'Activity Logs' },
     { path: '/errors', icon: MdBugReport, label: 'Error Logs' },
     // Settings ko yahan se hata kar niche fixed position pe dala hai

@@ -25,6 +25,7 @@ import CreateStaff from './pages/StaffManagement/CreateStaff';
 import StaffAwareHome from './components/StaffAwareHome';
 import ActivityLogs from './pages/ActivityLogs';
 import ErrorLogs from "./pages/ErrorLogs";
+import WalletRewards from "./pages/WalletRewards";
 
 const RequirePermission = ({ children, anyOf }) => {
   const { user, userType, loading } = useAuth();
@@ -186,6 +187,7 @@ function App() {
                 <Notifications />
               </RequirePermission>
             } />
+            <Route path="rewards" element={<WalletRewards />} />
             <Route path="/errors" element={<ErrorLogs />} />
             <Route path="settings" element={
               <RequirePermission anyOf={["VIEW_SETTINGS"]}>

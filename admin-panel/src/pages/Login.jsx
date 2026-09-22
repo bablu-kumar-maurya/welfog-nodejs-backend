@@ -6,6 +6,8 @@ import {
   MdLock,
   MdPerson,
   MdEmail,
+  MdVisibility,
+  MdVisibilityOff,
 } from "react-icons/md";
 import toast from "react-hot-toast";
 
@@ -17,6 +19,7 @@ const Login = () => {
   const [username, setUsername] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
 
   const handleSubmit = async (e) => {
@@ -128,13 +131,25 @@ const Login = () => {
               <div className="relative">
                 <MdLock className="absolute left-3 top-3 text-gray-500 text-xl" />
                 <input
-                  type="password"
+                  type={showPassword ? "text" : "password"}
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
-                  className="w-full pl-10 pr-4 py-3 bg-white border border-gray-300 rounded-lg text-black text-sm focus:outline-none focus:ring-2 focus:ring-primary-500"
+                  className="w-full pl-10 pr-10 py-3 bg-white border border-gray-300 rounded-lg text-black text-sm focus:outline-none focus:ring-2 focus:ring-primary-500"
                   placeholder="Password"
                   disabled={loading}
                 />
+                <button
+                  type="button"
+                  onClick={() => setShowPassword(!showPassword)}
+                  className="absolute right-3 top-3 text-gray-500 hover:text-gray-700 focus:outline-none"
+                  tabIndex={-1}
+                >
+                  {showPassword ? (
+                    <MdVisibilityOff className="text-xl" />
+                  ) : (
+                    <MdVisibility className="text-xl" />
+                  )}
+                </button>
               </div>
 
               <button

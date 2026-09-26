@@ -32,11 +32,13 @@ router.post("/", async (req, res) => {
       seller_id,
       userseller_id,
       isConnected,
+      reactivate, // ✅ NEW: account reactivate karne ke liye
     } = req.body;
 
     if (!mobile) {
       return res.status(400).json({ message: "Mobile number is required" });
     }
+
     mobile = mobile.replace(/\D/g, "");
 
     // Normalize shop user id from frontend (e.g. "1773")
@@ -53,24 +55,118 @@ router.post("/", async (req, res) => {
     // ==========================================
     if (existingUser && existingUser.isDeleted) {
       const thirtyDays = 30 * 24 * 60 * 60 * 1000;
+
       const timePassed =
         Date.now() - new Date(existingUser.deletedAt).getTime();
 
+      // ==========================================
+      // 1A. WITHIN 30 DAYS
+      // ==========================================
       if (timePassed <= thirtyDays) {
+
+        // ------------------------------------------
+        // USER WANTS TO REACTIVATE ACCOUNT
+        // ------------------------------------------
+        if (reactivate === true || reactivate === "true") {
+
+          // Restore User
+          existingUser.isDeleted = false;
+          existingUser.deletedAt = null;
+
+          // Agar permanently hidden flag pehle set hua ho
+          existingUser.isPermanentlyHidden = false;
+
+          await existingUser.save();
+
+          // ------------------------------------------
+          // RESTORE USER'S REELS
+          // ------------------------------------------
+          await Reel.updateMany(
+            {
+              user: existingUser._id,
+              isDeleted: true,
+              deletedAt: existingUser.deletedAt,
+            },
+            {
+              $set: {
+                isDeleted: false,
+                deletedAt: null,
+              },
+            }
+          );
+
+          // ------------------------------------------
+          // RESTORE USER'S COMMENTS
+          // ------------------------------------------
+          await Comment.updateMany(
+            {
+              user: existingUser._id,
+              isDeleted: true,
+            },
+            {
+              $set: {
+                isDeleted: false,
+                deletedAt: null,
+              },
+            }
+          );
+
+          return res.status(200).json({
+            message: "Account reactivated successfully",
+            _id: existingUser._id,
+            userid: existingUser.userid,
+            username: existingUser.username,
+            name: existingUser.name,
+            isConnected: existingUser.isConnected,
+            mobile: existingUser.mobile,
+            profilePicture: existingUser.profilePicture,
+            bio: existingUser.bio,
+            followers: existingUser.followers,
+            following: existingUser.following,
+            seller_id: existingUser.seller_id,
+            userseller_id: existingUser.userseller_id,
+          });
+        }
+
+        // ------------------------------------------
+        // ACCOUNT IS STILL IN 30-DAY RECOVERY PERIOD
+        // ------------------------------------------
         return res.status(403).json({
-          message: "Your account is deactivated. Do you want to reactivate it?",
+          message:
+            "Your account is deactivated. Do you want to reactivate it?",
           needsReactivation: true,
           mobile: existingUser.mobile,
         });
-      } else {
-        const timestamp = Date.now();
-        existingUser.mobile = `${existingUser.mobile}_hidden_${timestamp}`;
-        existingUser.username = `${existingUser.username}_hidden_${timestamp}`;
-        if (existingUser.email) {
-          existingUser.email = `${existingUser.email}_hidden_${timestamp}`;
-        }
-        existingUser.isPermanentlyHidden = true;
-        await existingUser.save();
+      }
+
+      // ==========================================
+      // 1B. 30 DAYS COMPLETED
+      // ==========================================
+      else {
+
+        // ------------------------------------------
+        // PERMANENTLY DELETE USER'S REELS
+        // ------------------------------------------
+        await Reel.deleteMany({
+          user: existingUser._id,
+        });
+
+        // ------------------------------------------
+        // PERMANENTLY DELETE USER'S COMMENTS
+        // ------------------------------------------
+        await Comment.deleteMany({
+          user: existingUser._id,
+        });
+
+        // ------------------------------------------
+        // PERMANENTLY DELETE USER
+        // ------------------------------------------
+        await User.deleteOne({
+          _id: existingUser._id,
+        });
+
+        // Existing user ko null karo
+        // taaki neeche fresh account creation logic chale
         existingUser = null;
       }
     }
@@ -93,11 +189,13 @@ router.post("/", async (req, res) => {
         const usernameTaken = await User.findOne({
           username: formattedUsername,
         });
+
         if (usernameTaken) {
           return res
             .status(400)
             .json({ message: "This username is already taken" });
         }
+
         existingUser.username = formattedUsername;
       }
 
@@ -113,7 +211,6 @@ router.post("/", async (req, res) => {
         existingUser.isConnected = isConnected;
         existingUser.lastConnectedAt = new Date();
       }
-
 
       if (incomingUserId) {
         existingUser.userid = incomingUserId;
@@ -154,6 +251,7 @@ router.post("/", async (req, res) => {
     }
 
     username = username.toLowerCase().trim();
+
     if (username.length < 3 || username.length > 20) {
       return res
         .status(400)
@@ -161,6 +259,7 @@ router.post("/", async (req, res) => {
     }
 
     const usernameRegex = /^[a-z0-9_]+$/;
+
     if (!usernameRegex.test(username)) {
       return res.status(400).json({
         message:
@@ -169,6 +268,7 @@ router.post("/", async (req, res) => {
     }
 
     const existingUsername = await User.findOne({ username });
+
     if (existingUsername) {
       return res.status(400).json({ message: "Username already taken" });
     }
@@ -206,10 +306,12 @@ router.post("/", async (req, res) => {
     });
   } catch (error) {
     console.error("Error processing user:", error);
+
     if (error.code === 11000) {
       const key = Object.keys(error.keyPattern)[0];
       return res.status(400).json({ message: `${key} already exists` });
     }
+
     return res.status(500).json({ message: "Server error" });
   }
 });
@@ -1178,13 +1280,27 @@ router.delete("/:id", async (req, res) => {
     const deletedUserName =
       user.userName || user.username || user.name || "Unknown User";
 
+    // ==========================================
+    // 1. SOFT DELETE USER
+    // ==========================================
+
+    const deletedAt = new Date();
+
     user.isDeleted = true;
-    user.deletedAt = new Date();
+    user.deletedAt = deletedAt;
+
     await user.save();
+
+    // ==========================================
+    // 2. SOFT DELETE USER RELATED DATA
+    // ==========================================
 
     await Promise.all([
       // ✅ 1. LIKES DELETE
-      Reel.updateMany({ likes: userId }, { $pull: { likes: userId } }),
+      Reel.updateMany(
+        { likes: userId },
+        { $pull: { likes: userId } }
+      ),
 
       // ✅ 2. VIEWS DELETE
       Reel.updateMany(
@@ -1192,21 +1308,35 @@ router.delete("/:id", async (req, res) => {
         {
           $pull: { viewsdata: userId },
           $inc: { views: -1 },
-        },
+        }
       ),
 
       // ✅ 3. COMMENTS SOFT DELETE
       Comment.updateMany(
         { user: userId },
-        { isDeleted: true, deletedAt: new Date() },
+        {
+          $set: {
+            isDeleted: true,
+            deletedAt: deletedAt,
+          },
+        }
       ),
 
-      // 🔥 4. NAYA FIX: REELS SOFT DELETE (Taaki API crash na ho)
+      // ✅ 4. REELS SOFT DELETE
       Reel.updateMany(
         { user: userId },
-        { isDeleted: true }
+        {
+          $set: {
+            isDeleted: true,
+            deletedAt: deletedAt,
+          },
+        }
       ),
     ]);
+
+    // ==========================================
+    // 3. LOG USER ACTION
+    // ==========================================
 
     try {
       await logUserAction({
@@ -1219,7 +1349,10 @@ router.delete("/:id", async (req, res) => {
         targetName: deletedUserName,
         device: req.headers["user-agent"],
         location: {
-          ip: req.headers["x-forwarded-for"] || req.socket.remoteAddress || "",
+          ip:
+            req.headers["x-forwarded-for"] ||
+            req.socket.remoteAddress ||
+            "",
           country: req.headers["cf-ipcountry"] || "",
         },
       });
@@ -1227,18 +1360,32 @@ router.delete("/:id", async (req, res) => {
       console.error("Soft delete user log error:", e.message);
     }
 
-    const thirtyDaysLater = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+    // ==========================================
+    // 4. CALCULATE 30 DAYS DELETION DATE
+    // ==========================================
+
+    const thirtyDaysLater = new Date(
+      deletedAt.getTime() + 30 * 24 * 60 * 60 * 1000
+    );
+
+    // ==========================================
+    // 5. RESPONSE
+    // ==========================================
 
     res.json({
       message: `Account deactivated successfully.`,
-      details: `Your account will be deactivated. If you log in before ${thirtyDaysLater.toDateString()}, your data will be restored. After this date, logging in will create a fresh account (your old data remains securely archived).`,
+      details: `Your account will be permanently deleted if you do not reactivate it before ${thirtyDaysLater.toDateString()}.`,
       scheduledDeletionDate: thirtyDaysLater,
     });
   } catch (err) {
     console.error("Error softly deleting user:", err);
     err.statusCode = err.statusCode || 500;
+
     // await logError(req, err);
-    res.status(500).json({ message: "Server error" });
+
+    res.status(500).json({
+      message: "Server error",
+    });
   }
 });
 
@@ -1250,52 +1397,116 @@ router.delete(
     try {
       const userId = req.params.id;
 
-      // 1. User find karo (delete hone se pehle)
-      const user = await User.findById(userId);
-      if (!user) return res.status(404).json({ message: "User not found" });
+      // ==========================================
+      // 1. FIND USER
+      // ==========================================
 
-      // Agar account pehle se deleted hai toh error do
+      const user = await User.findById(userId);
+
+      if (!user) {
+        return res.status(404).json({
+          message: "User not found",
+        });
+      }
+
+      // Already deleted check
       if (user.isDeleted) {
         return res.status(400).json({
           message: "Account is already scheduled for deletion.",
         });
       }
 
-      // 2. User ka naam save karo (response aur logs ke liye)
+      // User name save
       const deletedUserName =
-        user.userName || user.username || user.name || "Unknown User";
+        user.userName ||
+        user.username ||
+        user.name ||
+        "Unknown User";
 
-      // 3. User ko Soft Delete karo
+      // ==========================================
+      // 2. SOFT DELETE USER
+      // ==========================================
+
+      const deletedAt = new Date();
+
       user.isDeleted = true;
-      user.deletedAt = new Date();
+      user.deletedAt = deletedAt;
+
       await user.save();
 
-      // 4. Update Other Data (Ab Shares, Followers, Following Hard Delete Nahi Honge)
+      // ==========================================
+      // 3. SOFT DELETE USER RELATED DATA
+      // ==========================================
+
       await Promise.all([
-        // ✅ 1. Comments ko Soft Delete karo (Thappa lagao)
+        // ------------------------------------------
+        // COMMENTS SOFT DELETE
+        // ------------------------------------------
+
         Comment.updateMany(
           { user: userId },
-          { isDeleted: true, deletedAt: new Date() },
+          {
+            $set: {
+              isDeleted: true,
+              deletedAt: deletedAt,
+            },
+          }
         ),
 
-        // ✅ 2. LIKES DELETE (Jaisa aapne pehle bola tha ki ye hatne chahiye)
-        Reel.updateMany({ likes: userId }, { $pull: { likes: userId } }),
+        // ------------------------------------------
+        // REELS SOFT DELETE
+        // ------------------------------------------
 
-        // ✅ 3. VIEWS DELETE (Jaisa aapne pehle bola tha)
+        Reel.updateMany(
+          { user: userId },
+          {
+            $set: {
+              isDeleted: true,
+              deletedAt: deletedAt,
+            },
+          }
+        ),
+
+        // ------------------------------------------
+        // LIKES REMOVE
+        // ------------------------------------------
+
+        Reel.updateMany(
+          { likes: userId },
+          {
+            $pull: {
+              likes: userId,
+            },
+          }
+        ),
+
+        // ------------------------------------------
+        // VIEWS REMOVE
+        // ------------------------------------------
+
         Reel.updateMany(
           { viewsdata: userId },
           {
-            $pull: { viewsdata: userId },
-            $inc: { views: -1 },
-          },
+            $pull: {
+              viewsdata: userId,
+            },
+            $inc: {
+              views: -1,
+            },
+          }
         ),
 
-        // ❌ Yahan se Followers, Following aur Shares ka code HATA diya gaya hai.
-        // Iska matlab wo IDs array mein safe rahengi (Soft Delete jaisa behave karengi).
-        // Account restore hone par sab wapas mil jayega!
+        // ------------------------------------------
+        // Followers / Following / Shares
+        // ------------------------------------------
+        // Intentionally untouched
+        // Restore hone par ye data available rahega.
       ]);
 
-      // 5. Activity log mein save karo
+      // ==========================================
+      // 4. ACTIVITY LOG
+      // ==========================================
+
       try {
         await logUserAction({
           user: req.user._id,
@@ -1308,30 +1519,53 @@ router.delete(
           device: req.headers["user-agent"],
           location: {
             ip:
-              req.headers["x-forwarded-for"] || req.socket.remoteAddress || "",
+              req.headers["x-forwarded-for"] ||
+              req.socket.remoteAddress ||
+              "",
             country: req.headers["cf-ipcountry"] || "",
           },
         });
       } catch (e) {
-        console.error("Soft delete user log error:", e.message);
+        console.error(
+          "Soft delete user log error:",
+          e.message
+        );
       }
 
-      // 6. 30 din baad ki date nikal lo
-      const thirtyDaysLater = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+      // ==========================================
+      // 5. 30 DAYS DELETION DATE
+      // ==========================================
 
-      // 7. Admin ko success message bhej do
-      res.json({
+      const thirtyDaysLater = new Date(
+        deletedAt.getTime() + 30 * 24 * 60 * 60 * 1000
+      );
+
+      // ==========================================
+      // 6. RESPONSE
+      // ==========================================
+
+      return res.json({
         message: `User ${deletedUserName} deactivated successfully by Admin.`,
+
         details: `The account will be permanently deleted on ${thirtyDaysLater.toDateString()}.`,
+
         scheduledDeletionDate: thirtyDaysLater,
       });
     } catch (err) {
-      console.error("Error softly deleting user by admin:", err);
+      console.error(
+        "Error softly deleting user by admin:",
+        err
+      );
+
       err.statusCode = err.statusCode || 500;
+
       await logError(req, err);
-      res.status(500).json({ message: "Server error" });
+
+      return res.status(500).json({
+        message: "Server error",
+      });
     }
-  },
+  }
 );
 
 // follow to user

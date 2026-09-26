@@ -831,7 +831,18 @@ router.post("/conversations/:conversationId/delivered", async (req, res) => {
 // =========================================================
 // 7️⃣ MEDIA / FILE UPLOAD ENDPOINTS (🚀 OPTIMIZED FOR FAST S3 UPLINK)
 // =========================================================
-router.post("/upload", upload.single("file"), async (req, res) => {
+router.post("/upload", (req, res, next) => {
+  upload.any()(req, res, (err) => {
+    if (err) {
+      console.error("Multer upload error:", err.message);
+      return res.status(400).json({ success: false, message: err.message || "File upload error" });
+    }
+    if (!req.file && req.files && req.files.length > 0) {
+      req.file = req.files[0];
+    }
+    next();
+  });
+}, async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ success: false, message: "No file provided for upload" });
@@ -839,20 +850,42 @@ router.post("/upload", upload.single("file"), async (req, res) => {
 
     const folder = req.body.folder || "chat_media";
     let fileBuffer = req.file.buffer;
-    let mimeType = req.file.mimetype;
+    let mimeType = req.file.mimetype || "";
+    let originalName = req.file.originalname || `photo_${Date.now()}.jpg`;
 
-    // Fallback: If mimetype is application/octet-stream, guess from file extension
-    if ((mimeType === "application/octet-stream" || !mimeType) && req.file.originalname) {
-      const nameLower = req.file.originalname.toLowerCase();
+    // Fallback: If mimetype is application/octet-stream or missing, guess or default to image/jpeg
+    if (!mimeType || mimeType === "application/octet-stream" || mimeType === "binary/octet-stream") {
+      const nameLower = originalName.toLowerCase();
       if (nameLower.endsWith(".mp4") || nameLower.endsWith(".mov") || nameLower.endsWith(".avi") || nameLower.endsWith(".mkv") || nameLower.endsWith(".webm") || nameLower.endsWith(".3gp")) {
         mimeType = "video/mp4";
-      } else if (nameLower.endsWith(".jpg") || nameLower.endsWith(".jpeg") || nameLower.endsWith(".png") || nameLower.endsWith(".webp") || nameLower.endsWith(".gif")) {
+      } else if (nameLower.endsWith(".png")) {
+        mimeType = "image/png";
+      } else if (nameLower.endsWith(".webp")) {
+        mimeType = "image/webp";
+      } else if (nameLower.endsWith(".gif")) {
+        mimeType = "image/gif";
+      } else {
+        // Default camera photos to image/jpeg
         mimeType = "image/jpeg";
       }
     }
 
+    if (mimeType.startsWith("image/") && !originalName.includes(".")) {
+      const ext = mimeType.split("/")[1] || "jpg";
+      originalName = `${originalName}.${ext}`;
+    }
+
+    // Compress camera/gallery image for fast S3 upload
+    if (mimeType.startsWith("image/")) {
+      try {
+        fileBuffer = await compressImage(fileBuffer);
+      } catch (err) {
+        console.warn("Camera photo compression skipped/failed:", err.message);
+      }
+    }
+
     const processedFile = {
-      originalname: req.file.originalname,
+      originalname: originalName,
       mimetype: mimeType,
       buffer: fileBuffer
     };
@@ -865,11 +898,10 @@ router.post("/upload", upload.single("file"), async (req, res) => {
       try {
         const thumbnailBuffer = await generateVideoThumbnail(req.file.buffer);
         const thumbFile = {
-          originalname: `thumb-${req.file.originalname}.jpg`,
+          originalname: `thumb-${originalName}.jpg`,
           mimetype: "image/jpeg",
           buffer: thumbnailBuffer
         };
-        // Prepare thumb upload promise without awaiting immediately
         uploadThumbPromise = uploadToS3(thumbFile, folder);
       } catch (err) {
         console.warn("Video thumbnail generation failed:", err.message);
@@ -887,7 +919,7 @@ router.post("/upload", upload.single("file"), async (req, res) => {
       message: "File uploaded successfully to S3",
       fileUrl: uploadedFileUrl,
       thumbnailUrl: uploadedThumbnailUrl || null,
-      fileName: req.file.originalname,
+      fileName: originalName,
       fileSize: fileBuffer.length,
       mimeType: mimeType,
     });

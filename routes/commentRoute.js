@@ -597,88 +597,155 @@ router.get('/reel/:reelId', async (req, res) => {
 
     // 🔥 CRASH PREVENTION: Invalid reelId aane par crash na ho
     if (!mongoose.isValidObjectId(reelId)) {
-      return res.status(400).json({ message: "Invalid Reel ID" });
+      return res.status(400).json({
+        message: "Invalid Reel ID"
+      });
     }
 
     // 🛡️ BLOCK FILTER LOGIC START (Optimized with .lean)
     let blockedList = [];
+
     if (viewerId && mongoose.isValidObjectId(viewerId)) {
-      const viewer = await User.findById(viewerId).select("blockedUsers").lean();
-      if (viewer && viewer.blockedUsers && viewer.blockedUsers.length > 0) {
+      const viewer = await User.findById(viewerId)
+        .select("blockedUsers")
+        .lean();
+
+      if (
+        viewer &&
+        viewer.blockedUsers &&
+        viewer.blockedUsers.length > 0
+      ) {
         blockedList = viewer.blockedUsers;
       }
     }
+
     // 🛡️ BLOCK FILTER LOGIC END
 
-    // 🚀 OPTIMIZATION 1: Fetch Main Comments with .lean()
+
+    // 🚀 OPTIMIZATION 1:
+    // Fetch Main Comments with .lean()
+    // Soft deleted comments ko hide kiya gaya hai
     const mainComments = await Comment.find({
       reel: reelId,
       parentComment: null,
-      user: { $nin: blockedList } // Blocked logo ke main comments hide karo
+      isDeleted: { $ne: true }, // ✅ SOFT DELETED COMMENTS HIDE
+      user: { $nin: blockedList } // Blocked users ke comments hide
     })
       .populate('user', 'username profilePicture')
       .sort({ createdAt: -1 })
-      .lean(); // .lean() makes it plain JS object, 5x faster!
+      .lean();
 
-    // Agar koi comments nahi hain toh turant wapas return kar do
+
+    // ==========================================
+    // TOTAL VISIBLE COMMENTS COUNT
+    // ==========================================
+    // Main comments + replies dono count honge.
+    // Soft deleted aur blocked users count nahi honge.
+    const totalComments = await Comment.countDocuments({
+      reel: reelId,
+      isDeleted: { $ne: true },
+      user: { $nin: blockedList }
+    });
+
+
+    // Agar koi main comments nahi hain
     if (!mainComments || mainComments.length === 0) {
-      return res.status(200).json([]);
+      return res.status(200).json({
+        comments: [],
+        totalComments: totalComments
+      });
     }
 
-    // 🚀 OPTIMIZATION 2: N+1 Loop Killer (Fetch all replies in ONE query)
+
+    // 🚀 OPTIMIZATION 2:
+    // N+1 Loop Killer
+    // Saare replies ek hi query me fetch honge
+
     const mainCommentIds = new Array(mainComments.length);
+
     for (let i = 0; i < mainComments.length; i++) {
       mainCommentIds[i] = mainComments[i]._id;
     }
 
-    // Ek hi query me saare replies nikal liye ($in operator ka use karke)
+
+    // Ek hi query me saare replies nikal liye
+    // Soft deleted replies bhi hide honge
     const allReplies = await Comment.find({
       parentComment: { $in: mainCommentIds },
-      user: { $nin: blockedList } // Blocked logo ke replies hide karo
+      isDeleted: { $ne: true }, // ✅ SOFT DELETED REPLIES HIDE
+      user: { $nin: blockedList } // Blocked users ke replies hide
     })
       .populate('user', 'username profilePicture')
       .sort({ createdAt: 1 })
       .lean();
 
-    // 🚀 OPTIMIZATION 3: Fast In-Memory Grouping (No Database waiting)
-    // Javascript engine me ek Hash Map banaya taaki replies apne parent ke paas instantly chali jaye
+
+    // 🚀 OPTIMIZATION 3:
+    // Fast In-Memory Grouping
+    // Replies ko unke parent comment ke according group karna
+
     const repliesMap = {};
+
     for (let i = 0; i < allReplies.length; i++) {
       const reply = allReplies[i];
+
       const parentIdStr = reply.parentComment.toString();
 
       if (!repliesMap[parentIdStr]) {
         repliesMap[parentIdStr] = [];
       }
+
       repliesMap[parentIdStr].push(reply);
     }
 
-    // Main comments ke sath unke replies ko attach kar diya
+
+    // ==========================================
+    // MAIN COMMENTS + REPLIES ATTACH
+    // ==========================================
+
     const commentsWithReplies = new Array(mainComments.length);
+
     for (let i = 0; i < mainComments.length; i++) {
       const comment = mainComments[i];
+
       const commentIdStr = comment._id.toString();
 
-      // Kyunki humne .lean() lagaya tha, toh comment._doc ki zarurat hi nahi hai
+      // Kyunki humne .lean() lagaya tha,
+      // comment._doc ki zarurat nahi hai
+
       commentsWithReplies[i] = {
         ...comment,
+
         replies: repliesMap[commentIdStr] || []
       };
     }
 
-    return res.status(200).json(commentsWithReplies);
+
+    // ==========================================
+    // FINAL RESPONSE
+    // ==========================================
+
+    return res.status(200).json({
+      comments: commentsWithReplies,
+      totalComments: totalComments
+    });
+
 
   } catch (error) {
     console.error("Error fetching comments:", error);
+
     if (!res.headersSent) {
+
       if (typeof logError === 'function') {
         await logError(req, error);
       }
-      return res.status(500).json({ message: "Internal Server Error" });
+
+      return res.status(500).json({
+        message: "Internal Server Error"
+      });
     }
   }
 });
-
 // comment like dislike
 router.put("/like/:id", async (req, res) => {
   try {

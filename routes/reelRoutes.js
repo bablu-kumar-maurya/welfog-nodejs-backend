@@ -718,10 +718,52 @@ router.get("/shownew", async (req, res) => {
             matchStage._id = { $nin: excludedReelIds };
         }
 
+        const commentMatch = {
+            $expr: { $eq: ["$reel", "$$reelId"] },
+            isDeleted: { $ne: true }
+        };
+
+        if (viewer && viewer.blockedUsers && viewer.blockedUsers.length > 0) {
+            commentMatch.user = { $nin: viewer.blockedUsers };
+        }
+
         // 🎬 Aggregate random reels
         const reels = await Reel.aggregate([
             { $match: matchStage },
-            { $sample: { size: limit } }
+            { $sample: { size: limit } },
+
+            {
+                $lookup: {
+                    from: "comments",
+                    let: { reelId: "$_id" },
+                    pipeline: [
+                        {
+                            $match: commentMatch
+                        },
+                        {
+                            $count: "count"
+                        }
+                    ],
+                    as: "commentCountData"
+                }
+            },
+
+            {
+                $addFields: {
+                    commentCount: {
+                        $ifNull: [
+                            { $arrayElemAt: ["$commentCountData.count", 0] },
+                            0
+                        ]
+                    }
+                }
+            },
+
+            {
+                $project: {
+                    commentCountData: 0
+                }
+            }
         ]);
 
         // 🔥 Populate
@@ -1001,6 +1043,18 @@ router.get("/current/:id", async (req, res) => {
             }
         }
 
+        // 🔥 COMMENT COUNT FIX ONLY
+        // Same visibility logic as /comment/reel/:reelId
+        // Soft-deleted comments count nahi honge
+        // Blocked users ke comments bhi count nahi honge
+        const blockedList = viewer?.blockedUsers || [];
+
+        const commentCount = await Comment.countDocuments({
+            reel: currentReel._id,
+            isDeleted: { $ne: true },
+            user: { $nin: blockedList }
+        });
+
         // 5️⃣ Fetch profile pictures
         const currentUserProfilePic = viewer?.profilePicture || "";
         const reelUserProfilePic = owner?.profilePicture || "";
@@ -1027,6 +1081,9 @@ router.get("/current/:id", async (req, res) => {
             reelUserProfilePic,
             currentUserProfilePic,
             isFollowing,
+
+            // 🔥 Correct comment count
+            commentCount,
         };
 
         // 8️⃣ Send response
@@ -1230,6 +1287,36 @@ router.get("/others/:userId", async (req, res) => {
             return res.status(200).json([]);
         }
 
+        // 🔥 COMMENT COUNT FIX
+        // Sirf non-deleted comments count honge.
+        // Reel.comments array me pade stale/deleted comment IDs count nahi honge.
+        const reelIds = new Array(reels.length);
+
+        for (let i = 0; i < reels.length; i++) {
+            reelIds[i] = reels[i]._id;
+        }
+
+        const commentCounts = await Comment.aggregate([
+            {
+                $match: {
+                    reel: { $in: reelIds },
+                    isDeleted: { $ne: true }
+                }
+            },
+            {
+                $group: {
+                    _id: "$reel",
+                    count: { $sum: 1 }
+                }
+            }
+        ]);
+
+        const commentCountMap = {};
+
+        for (let i = 0; i < commentCounts.length; i++) {
+            commentCountMap[commentCounts[i]._id.toString()] = commentCounts[i].count;
+        }
+
         const currentUserProfilePic = viewer?.profilePicture || "";
         const currentUserIdStr = viewer ? viewer._id.toString() : (currentUserId ? currentUserId.toString() : "");
 
@@ -1258,6 +1345,9 @@ router.get("/others/:userId", async (req, res) => {
                 reelUserProfilePic: reelOwner.profilePicture || "",
                 currentUserProfilePic,
                 isFollowing: isFollowing,
+
+                // 🔥 FIXED COMMENT COUNT
+                commentCount: commentCountMap[reel._id.toString()] || 0,
             };
         }
 

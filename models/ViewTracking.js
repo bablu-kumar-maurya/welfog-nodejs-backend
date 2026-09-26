@@ -34,6 +34,10 @@ const viewTrackingSchema = new mongoose.Schema(
       type: Number,
       default: 0,
     },
+    watchTime: {
+      type: Number,
+      default: 0,
+    },
     videoDuration: {
       type: Number,
       default: 0,

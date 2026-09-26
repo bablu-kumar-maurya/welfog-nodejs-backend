@@ -769,6 +769,7 @@ router.get("/shownew", async (req, res) => {
         }
     }
 });
+
 router.post("/view", async (req, res) => {
     try {
         const { reelId, userId } = req.body;
@@ -826,49 +827,84 @@ router.post("/view", async (req, res) => {
             { new: true }
         );
 
-        if (!updated) {
-            // Either reel not found, or user already counted (can't distinguish without another query)
-            const reelExists = await Reel.exists({ _id: reelId });
-            if (!reelExists) return res.status(404).json({ message: "Reel not found" });
-            return res.status(200).json({ message: "View already counted" });
-        }
+        const currentViews = updated ? updated.views : (currentReel.views || 0);
 
-        // 🎯 WALLET & MILESTONE REWARD INTEGRATION (70% Watch Validation & Milestone Credit)
+        // 🎯 WALLET & MILESTONE REWARD & VIEW TRACKING INTEGRATION (70% Watch Validation)
         let rewardResult = null;
         try {
-            const { watchPercentage, watchedDuration, videoDuration, sessionId } = req.body;
-            let qualifiesForReward = true;
+            const {
+                watchPercentage,
+                percentage,
+                watch_percentage,
+                watchedDuration,
+                watchTime,
+                watch_time,
+                watchedTime,
+                videoDuration,
+                video_duration,
+                duration,
+                sessionId,
+                session_id,
+            } = req.body;
 
-            if (watchPercentage !== undefined && watchPercentage !== null && !isNaN(Number(watchPercentage))) {
-                qualifiesForReward = Number(watchPercentage) >= 70;
-            } else if (watchedDuration && videoDuration && Number(videoDuration) > 0) {
-                qualifiesForReward = (Number(watchedDuration) / Number(videoDuration)) * 100 >= 70;
+            const rawWatchTime = watchTime ?? watch_time ?? watchedDuration ?? watchedTime ?? 0;
+            const rawVideoDuration = videoDuration ?? video_duration ?? duration ?? currentReel.duration ?? 0;
+            const rawPercentage = watchPercentage ?? percentage ?? watch_percentage;
+
+            const effWatchedDuration = Number(rawWatchTime) || 0;
+            const effVideoDuration = Number(rawVideoDuration) || 0;
+
+            let calculatedPercentage = 0;
+            if (rawPercentage !== undefined && rawPercentage !== null && !isNaN(Number(rawPercentage))) {
+                calculatedPercentage = Number(rawPercentage);
+            } else if (effVideoDuration > 0 && effWatchedDuration > 0) {
+                calculatedPercentage = (effWatchedDuration / effVideoDuration) * 100;
+            } else if (effWatchedDuration >= 70 && effVideoDuration === 0) {
+                calculatedPercentage = effWatchedDuration;
+            } else {
+                calculatedPercentage = 100; // Default if not specified
             }
 
-            if (qualifiesForReward && currentReel.user) {
-                // Record View tracking
-                const activeSessionId = sessionId || `view_${user._id}_${Date.now()}`;
+            const qualifiesForReward = calculatedPercentage >= 70;
+
+            if (qualifiesForReward) {
+                // Record View tracking document
+                const activeSessionId = sessionId || session_id || `view_${user._id}_${Date.now()}`;
                 try {
                     await ViewTracking.create({
                         user: user._id,
                         userId: user.userid || "",
                         reel: reelId,
                         sessionId: activeSessionId,
-                        watchPercentage: 100,
+                        watchPercentage: Math.min(100, Math.round(calculatedPercentage)),
+                        watchedDuration: effWatchedDuration,
+                        watchTime: effWatchedDuration,
+                        videoDuration: effVideoDuration,
+                        ipAddress: req.ip || "",
+                        userAgent: req.headers["user-agent"] || "",
                         viewedAt: new Date(),
                     });
-                } catch (vtErr) {}
+                } catch (vtErr) { }
 
-                // Process Milestone Reward for Creator
-                rewardResult = await rewardService.processMilestoneReward({
-                    reelId,
-                    creatorId: currentReel.user,
-                    currentCount: updated.views,
-                    type: "VIEW",
-                });
+                // Process Milestone Reward for Creator if this was a new view
+                if (updated && currentReel.user) {
+                    rewardResult = await rewardService.processMilestoneReward({
+                        reelId,
+                        creatorId: currentReel.user,
+                        currentCount: currentViews,
+                        type: "VIEW",
+                    });
+                }
             }
         } catch (rewardErr) {
-            console.error("View milestone reward error:", rewardErr.message);
+            console.error("❌ Error processing view tracking/reward:", rewardErr);
+        }
+
+        if (!updated) {
+            return res.status(200).json({
+                message: "View already counted on reel, tracking logged",
+                views: currentViews,
+            });
         }
 
         return res.status(200).json({
@@ -1430,9 +1466,6 @@ router.put("/update/:id", async (req, res) => {
 
 // Like or Unlike a Reel
 router.put("/like/:id", async (req, res) => {
-    console.log("========== LIKE API ==========");
-    console.log("BODY:", req.body);
-    console.log("REEL ID:", req.params.id);
     try {
         const { userId } = req.body; // who is liking
         const reelId = req.params.id;
@@ -1500,7 +1533,7 @@ router.put("/like/:id", async (req, res) => {
                     { $set: { userId: user.userid, status: "UNLIKED", lastUnlikedAt: new Date() } },
                     { upsert: true }
                 );
-            } catch (ltErr) {}
+            } catch (ltErr) { }
 
             const milestoneStatus = await rewardService.getMilestoneStatus({
                 reelId: reel._id,
@@ -1534,7 +1567,7 @@ router.put("/like/:id", async (req, res) => {
                     { $set: { userId: user.userid, status: "LIKED", lastLikedAt: new Date() } },
                     { upsert: true }
                 );
-            } catch (ltErr) {}
+            } catch (ltErr) { }
 
             // 🔔 CREATE LIKE NOTIFICATION
             console.log("========== NOTIFICATION ==========");

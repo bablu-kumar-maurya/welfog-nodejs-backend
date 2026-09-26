@@ -29,6 +29,7 @@ async function resolveUser(req, res, next) {
     if (!extractedUserId) {
       extractedUserId =
         req.body.userId ||
+        req.body.senderId ||
         req.body.currentUserId ||
         req.query.userId ||
         req.query.currentUserId ||

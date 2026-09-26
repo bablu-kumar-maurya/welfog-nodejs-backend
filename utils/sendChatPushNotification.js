@@ -78,7 +78,7 @@ const sendChatPushNotification = async ({
           id: `${conversation._id}_${Date.now()}`,
           user_id: isNaN(Number(rawUserId)) ? rawUserId : Number(rawUserId),
           data: {
-            Type: "chat", // Must be "Play" to route correctly on production server!
+            Type: "Play", // Must be "Play" to route correctly on production server & Flutter app!
             id: `${conversation._id}_${Date.now()}`,
             message: formattedMessage,
             recipient: recipientId.toString(),

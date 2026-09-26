@@ -71,11 +71,20 @@ async function handleRecordView(req, res) {
     const user = req.resolvedUser || null;
     const {
       watchPercentage,
+      percentage,
+      watch_percentage,
       watchedDuration,
-      videoDuration,
-      duration,
+      watchTime,
+      watch_time,
       watchedTime,
+      watchDuration,
+      timeWatched,
+      videoDuration,
+      video_duration,
+      duration,
+      totalDuration,
       sessionId,
+      session_id,
       viewSessionId,
     } = req.body;
 
@@ -89,13 +98,18 @@ async function handleRecordView(req, res) {
       return res.status(404).json({ success: false, message: "Reel not found" });
     }
 
-    // 2. Calculate and Validate Watch Percentage
-    let calculatedPercentage = 0;
-    const effVideoDuration = Number(videoDuration || duration || reel.duration || 0);
-    const effWatchedDuration = Number(watchedDuration || watchedTime || 0);
+    // 2. Extract watch duration and video duration from all possible parameter aliases
+    const rawWatchTime = watchTime ?? watch_time ?? watchedDuration ?? watchedTime ?? watchDuration ?? timeWatched ?? 0;
+    const rawVideoDuration = videoDuration ?? video_duration ?? duration ?? totalDuration ?? reel.duration ?? 0;
+    const rawPercentage = watchPercentage ?? percentage ?? watch_percentage;
 
-    if (watchPercentage !== undefined && watchPercentage !== null && !isNaN(Number(watchPercentage))) {
-      calculatedPercentage = Number(watchPercentage);
+    const effWatchedDuration = Number(rawWatchTime) || 0;
+    const effVideoDuration = Number(rawVideoDuration) || 0;
+
+    // 3. Calculate Watch Percentage
+    let calculatedPercentage = 0;
+    if (rawPercentage !== undefined && rawPercentage !== null && !isNaN(Number(rawPercentage))) {
+      calculatedPercentage = Number(rawPercentage);
     } else if (effVideoDuration > 0 && effWatchedDuration > 0) {
       calculatedPercentage = (effWatchedDuration / effVideoDuration) * 100;
     } else if (effWatchedDuration >= 70 && effVideoDuration === 0) {
@@ -117,14 +131,15 @@ async function handleRecordView(req, res) {
       });
     }
 
-    // 3. Deduplication Check via Session Identifier
+    // 4. Deduplication Check via Session Identifier
     const activeSessionId =
       sessionId ||
+      session_id ||
       viewSessionId ||
       (user ? `user_${user._id}_${Date.now()}` : `ip_${req.ip || "unknown"}_${Date.now()}`);
 
     // If explicit sessionId provided, check if already recorded
-    if (sessionId || viewSessionId) {
+    if (sessionId || session_id || viewSessionId) {
       const existingView = await ViewTracking.findOne({
         reel: reel._id,
         sessionId: activeSessionId,
@@ -145,7 +160,7 @@ async function handleRecordView(req, res) {
       }
     }
 
-    // 4. Record View in ViewTracking Collection
+    // 5. Record View in ViewTracking Collection
     try {
       await ViewTracking.create({
         user: user ? user._id : null,
@@ -154,6 +169,7 @@ async function handleRecordView(req, res) {
         sessionId: activeSessionId,
         watchPercentage: Math.min(100, Math.round(calculatedPercentage)),
         watchedDuration: effWatchedDuration,
+        watchTime: effWatchedDuration,
         videoDuration: effVideoDuration,
         ipAddress: req.ip || "",
         userAgent: req.headers["user-agent"] || "",

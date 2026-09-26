@@ -99,6 +99,13 @@ const WalletRewards = () => {
   const [sortBy, setSortBy] = useState('requirement'); // 'requirement' | 'coins' | 'status' | 'updatedAt'
   const [sortOrder, setSortOrder] = useState('asc'); // 'asc' | 'desc'
 
+  // Dynamic Coin to Rupee Rate State
+  const [coinSetting, setCoinSetting] = useState({ coins: 1, rupees: 5 });
+  const [isCoinModalOpen, setIsCoinModalOpen] = useState(false);
+  const [coinFormData, setCoinFormData] = useState({ coins: 1, rupees: 5 });
+  const [coinFormError, setCoinFormError] = useState('');
+  const [savingCoinSetting, setSavingCoinSetting] = useState(false);
+
   // Action Menu state
   const [activeMenuId, setActiveMenuId] = useState(null);
 
@@ -154,9 +161,68 @@ const WalletRewards = () => {
     }
   };
 
+  // Fetch Coin to Rupee Rate from Backend API
+  const fetchCoinSetting = async () => {
+    try {
+      const res = await api.get('/api/rewards/coin-setting');
+      if (res.data && res.data.setting) {
+        setCoinSetting({
+          coins: res.data.setting.coins || 1,
+          rupees: res.data.setting.rupees || 5,
+        });
+      }
+    } catch (err) {
+      console.error('Error fetching coin conversion setting:', err);
+    }
+  };
+
   useEffect(() => {
     fetchRules();
+    fetchCoinSetting();
   }, []);
+
+  const handleOpenCoinModal = () => {
+    setCoinFormData({
+      coins: coinSetting.coins || 1,
+      rupees: coinSetting.rupees || 5,
+    });
+    setCoinFormError('');
+    setIsCoinModalOpen(true);
+  };
+
+  const handleSaveCoinSetting = async (e) => {
+    e.preventDefault();
+    const cNum = Number(coinFormData.coins);
+    const rNum = Number(coinFormData.rupees);
+
+    if (isNaN(cNum) || cNum <= 0) {
+      setCoinFormError('Coins must be at least 1');
+      return;
+    }
+    if (isNaN(rNum) || rNum < 0) {
+      setCoinFormError('Rupees must be 0 or greater');
+      return;
+    }
+
+    try {
+      setSavingCoinSetting(true);
+      const res = await api.post('/api/rewards/coin-setting', {
+        coins: cNum,
+        rupees: rNum,
+        updatedBy: 'Admin',
+      });
+      if (res.data && res.data.success) {
+        toast.success(res.data.message || 'Coin conversion rate updated successfully!');
+        setCoinSetting({ coins: cNum, rupees: rNum });
+        setIsCoinModalOpen(false);
+      }
+    } catch (err) {
+      console.error('Error saving coin setting:', err);
+      toast.error(err.response?.data?.message || 'Failed to update coin setting');
+    } finally {
+      setSavingCoinSetting(false);
+    }
+  };
 
   // Metrics
   const totalRules = rules.length;
@@ -414,6 +480,40 @@ const WalletRewards = () => {
           >
             <MdAdd className="text-xl" />
             <span>Add Reward Rule</span>
+          </button>
+        </div>
+      </div>
+
+      {/* COIN TO RUPEE CONVERSION RATE CARD */}
+      <div className="bg-gradient-to-r from-emerald-600 via-teal-600 to-emerald-700 rounded-xl p-5 text-white shadow-md flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
+        <div className="flex items-center gap-4">
+          <div className="w-12 h-12 rounded-xl bg-white/20 backdrop-blur-md flex items-center justify-center shrink-0 text-2xl font-black shadow-inner">
+            ₹
+          </div>
+          <div>
+            <div className="flex items-center gap-2">
+              <span className="text-xs font-bold uppercase tracking-wider text-emerald-200">Coin Conversion Rate</span>
+              <span className="bg-emerald-500/30 text-emerald-100 text-[10px] px-2 py-0.5 rounded-full font-bold border border-emerald-400/30 tracking-wide">
+                DYNAMIC DB RATE
+              </span>
+            </div>
+            <h2 className="text-xl md:text-2xl font-extrabold mt-0.5 flex items-baseline gap-2">
+              <span>{coinSetting.coins} Coin = ₹{coinSetting.rupees}</span>
+              <span className="text-sm font-normal text-emerald-100">({coinSetting.rupees} Rupees per Coin)</span>
+            </h2>
+            <p className="text-xs text-emerald-100/90 mt-1">
+              Users earn rewards in coins. Currently, 1 coin is valued at ₹{coinSetting.rupees} INR in the app wallet system.
+            </p>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-3 shrink-0 self-end md:self-auto">
+          <button
+            onClick={handleOpenCoinModal}
+            className="flex items-center gap-2 px-4 py-2.5 bg-white text-emerald-800 hover:bg-emerald-50 font-bold text-sm rounded-lg shadow transition-all hover:scale-105 active:scale-95 cursor-pointer"
+          >
+            <MdEdit className="text-lg text-emerald-700" />
+            <span>Edit Coin Rate</span>
           </button>
         </div>
       </div>
@@ -1312,6 +1412,96 @@ const WalletRewards = () => {
                 Delete Rule
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* 11. EDIT COIN TO RUPEE CONVERSION RATE MODAL */}
+      {isCoinModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4 animate-fadeIn">
+          <div className="bg-white rounded-2xl shadow-xl w-full max-w-md overflow-hidden border border-gray-100">
+            <div className="flex items-center justify-between p-5 border-b border-gray-100 bg-gradient-to-r from-emerald-50 to-teal-50">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 bg-emerald-600 text-white rounded-xl flex items-center justify-center font-black text-lg shadow-sm">
+                  ₹
+                </div>
+                <div>
+                  <h3 className="text-lg font-bold text-gray-900">Edit Coin Rate</h3>
+                  <p className="text-xs text-gray-500">Update rupee conversion value per coin</p>
+                </div>
+              </div>
+              <button
+                onClick={() => setIsCoinModalOpen(false)}
+                className="text-gray-400 hover:text-gray-600 p-1.5 rounded-lg hover:bg-white/80 transition-colors"
+              >
+                <MdClose className="text-xl" />
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveCoinSetting} className="p-5 space-y-4">
+              {coinFormError && (
+                <div className="p-3 bg-rose-50 text-rose-700 border border-rose-200 text-xs rounded-lg font-medium">
+                  {coinFormError}
+                </div>
+              )}
+
+              <div>
+                <label className="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-1">
+                  Coins Amount
+                </label>
+                <input
+                  type="number"
+                  min="1"
+                  value={coinFormData.coins}
+                  onChange={(e) => setCoinFormData({ ...coinFormData, coins: e.target.value })}
+                  className="w-full px-3 py-2.5 bg-gray-50 border border-gray-200 rounded-lg text-sm font-semibold text-gray-900 focus:ring-2 focus:ring-emerald-500 focus:bg-white focus:outline-none transition-all"
+                  placeholder="1"
+                  required
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-1">
+                  Rupee Equivalent (₹)
+                </label>
+                <div className="relative">
+                  <span className="absolute left-3.5 top-1/2 -translate-y-1/2 text-emerald-700 font-bold text-base">
+                    ₹
+                  </span>
+                  <input
+                    type="number"
+                    min="0"
+                    step="0.1"
+                    value={coinFormData.rupees}
+                    onChange={(e) => setCoinFormData({ ...coinFormData, rupees: e.target.value })}
+                    className="w-full pl-9 pr-3 py-2.5 bg-gray-50 border border-gray-200 rounded-lg text-sm font-bold text-gray-900 focus:ring-2 focus:ring-emerald-500 focus:bg-white focus:outline-none transition-all"
+                    placeholder="e.g. 5"
+                    required
+                  />
+                </div>
+                <p className="text-xs text-gray-500 mt-1.5 leading-relaxed">
+                  Formula: <span className="font-semibold text-emerald-700">{coinFormData.coins || 1} Coin = ₹{coinFormData.rupees || 0}</span>.
+                  Users with 100 Coins will hold <span className="font-semibold text-emerald-700">₹{(Number(coinFormData.rupees) || 0) * 100} INR</span> value.
+                </p>
+              </div>
+
+              <div className="pt-3 flex items-center justify-end gap-3 border-t border-gray-100">
+                <button
+                  type="button"
+                  onClick={() => setIsCoinModalOpen(false)}
+                  className="px-4 py-2 text-sm font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 rounded-lg transition-colors cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={savingCoinSetting}
+                  className="px-5 py-2 text-sm font-bold text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg shadow-sm transition-all disabled:opacity-50 cursor-pointer"
+                >
+                  {savingCoinSetting ? 'Saving...' : 'Save Conversion Rate'}
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}

@@ -1649,4 +1649,302 @@ router.delete("/conversations/:conversationId/co-admins/:targetId", async (req, 
   }
 });
 
+// =========================================================
+// 1️⃣4️⃣ BACKGROUND NOTIFICATION QUICK-REPLY API
+// =========================================================
+router.post(
+  [
+    "/notification-reply",
+    "/conversations/reply-notification",
+    "/conversations/:conversationId/reply-notification",
+    "/reply",
+  ],
+  async (req, res) => {
+    try {
+      const conversationIdFromParam = req.params.conversationId;
+      const {
+        conversationId,
+        targetUserId,
+        recipientId,
+        text,
+        message,
+        replyText,
+        replyTo,
+        messageId,
+      } = req.body;
+
+      // Authenticated user resolution via auth middleware or fallback
+      let senderDoc = req.resolvedUser;
+      if (!senderDoc) {
+        const potentialSenderId =
+          req.body.senderId ||
+          req.body.userId ||
+          req.body.currentUserId ||
+          req.user?.id ||
+          req.user?._id ||
+          req.user?.userId ||
+          req.user?.userid;
+
+        if (potentialSenderId) {
+          senderDoc = await resolveUserDoc(potentialSenderId);
+        }
+      }
+
+      if (!senderDoc) {
+        return res.status(401).json({
+          success: false,
+          message: "Unauthorized: Invalid or missing authentication credentials",
+        });
+      }
+
+      const actualText = message || text || replyText;
+      const actualReplyTo = replyTo || messageId;
+      const targetConvId = conversationIdFromParam || conversationId;
+
+      if (!actualText || !actualText.trim()) {
+        return res.status(400).json({
+          success: false,
+          message: "Reply text (message) is required",
+        });
+      }
+
+      if (actualText.trim().length > 10000) {
+        return res.status(400).json({
+          success: false,
+          message: "Message exceeds maximum allowed length",
+        });
+      }
+
+      let conversation = null;
+
+      // 1. Try finding conversation by conversationId
+      if (targetConvId) {
+        if (!mongoose.isValidObjectId(targetConvId)) {
+          return res.status(400).json({
+            success: false,
+            message: "Invalid conversationId format",
+          });
+        }
+        conversation = await Conversation.findById(targetConvId);
+      }
+
+      // 2. If no conversation found yet and targetUserId/recipientId exists, resolve 1-to-1 conversation
+      if (!conversation && (targetUserId || recipientId)) {
+        const targetDoc = await resolveUserDoc(targetUserId || recipientId);
+        if (targetDoc) {
+          conversation = await Conversation.findOne({
+            isGroup: false,
+            participants: { $all: [senderDoc._id, targetDoc._id] },
+          });
+
+          if (!conversation) {
+            conversation = new Conversation({
+              isGroup: false,
+              participants: [senderDoc._id, targetDoc._id],
+              unreadCounts: {
+                [senderDoc._id.toString()]: 0,
+                [targetDoc._id.toString()]: 0,
+              },
+            });
+            await conversation.save();
+          }
+        }
+      }
+
+      if (!conversation) {
+        return res.status(404).json({
+          success: false,
+          message: "Conversation not found",
+        });
+      }
+
+      const senderIdStr = senderDoc._id.toString();
+
+      // Verify that the authenticated user is a participant of the conversation
+      const isParticipant = conversation.participants.some(
+        (p) => p.toString() === senderIdStr
+      );
+      if (!isParticipant) {
+        return res.status(403).json({
+          success: false,
+          message: "Unauthorized: You are not a participant in this conversation",
+        });
+      }
+
+      let isReceiverBlocked = false;
+      let otherUserId = null;
+
+      if (!conversation.isGroup && conversation.participants.length === 2) {
+        otherUserId = conversation.participants.find(
+          (p) => p.toString() !== senderIdStr
+        );
+
+        if (otherUserId) {
+          const otherDoc = await User.findById(otherUserId)
+            .select("blockedUsers")
+            .lean();
+
+          const senderBlockedOther = senderDoc.blockedUsers?.some(
+            (id) => id.toString() === otherUserId.toString()
+          );
+          const otherBlockedSender = otherDoc?.blockedUsers?.some(
+            (id) => id.toString() === senderIdStr
+          );
+
+          if (senderBlockedOther) {
+            return res.status(403).json({
+              success: false,
+              message: "Messaging is blocked between these users",
+            });
+          }
+          if (otherBlockedSender) {
+            isReceiverBlocked = true;
+          }
+        }
+      }
+
+      const deliveredTo = [];
+      conversation.participants.forEach((partId) => {
+        const partStr = partId.toString();
+        if (
+          partStr !== senderIdStr &&
+          isUserOnline(partStr) &&
+          !isReceiverBlocked
+        ) {
+          deliveredTo.push(partId);
+        }
+      });
+
+      const newMessage = new Message({
+        conversation: conversation._id,
+        sender: senderDoc._id,
+        type: "text",
+        text: actualText.trim(),
+        replyTo:
+          actualReplyTo && mongoose.isValidObjectId(actualReplyTo)
+            ? actualReplyTo
+            : null,
+        status: deliveredTo.length > 0 ? "delivered" : "sent",
+        deliveredTo,
+        seenBy: [],
+        deletedFor: isReceiverBlocked ? [otherUserId] : [],
+      });
+
+      await newMessage.save();
+
+      const populateQuery = [
+        { path: "sender", select: "username name profilePicture userid" },
+      ];
+      if (newMessage.replyTo) {
+        populateQuery.push({
+          path: "replyTo",
+          select: "text type sender mediaUrl fileName",
+          populate: {
+            path: "sender",
+            select: "username name profilePicture userid",
+          },
+        });
+      }
+
+      conversation.lastMessage = newMessage._id;
+      conversation.lastMessageAt = new Date();
+      conversation.isDeleted = false;
+      conversation.deletedFor = [];
+
+      conversation.participants.forEach((partId) => {
+        const partStr = partId.toString();
+        if (partStr !== senderIdStr && !isReceiverBlocked) {
+          const currentCount = conversation.unreadCounts
+            ? (typeof conversation.unreadCounts.get === "function"
+              ? conversation.unreadCounts.get(partStr)
+              : conversation.unreadCounts[partStr]) || 0
+            : 0;
+          if (
+            conversation.unreadCounts &&
+            typeof conversation.unreadCounts.set === "function"
+          ) {
+            conversation.unreadCounts.set(partStr, currentCount + 1);
+          } else if (conversation.unreadCounts) {
+            conversation.unreadCounts[partStr] = currentCount + 1;
+          }
+        }
+      });
+
+      await Promise.all([
+        newMessage.populate(populateQuery),
+        conversation.save(),
+      ]);
+
+      const messageData = newMessage.toObject();
+      const io = req.app.get("io");
+
+      // Trigger push notification to recipient(s)
+      try {
+        const sendChatPushNotification = require("../utils/sendChatPushNotification");
+        sendChatPushNotification({
+          conversation,
+          senderDoc,
+          messageDoc: newMessage,
+          io,
+        });
+      } catch (err) {
+        console.error(
+          "❌ Failed to trigger chat push notification from reply:",
+          err.message
+        );
+      }
+
+      // Socket Emissions
+      if (io) {
+        if (isReceiverBlocked) {
+          io.to(`user:${senderIdStr}`).emit("new_message", messageData);
+          if (senderDoc.userid) {
+            io.to(`user:${senderDoc.userid}`).emit("new_message", messageData);
+          }
+        } else {
+          let broadcastTarget = io.to(`conv:${conversation._id.toString()}`);
+          conversation.participants.forEach((partId) => {
+            const pStr = partId.toString();
+            broadcastTarget = broadcastTarget.to(`user:${pStr}`);
+          });
+          broadcastTarget.emit("new_message", messageData);
+        }
+
+        conversation.participants.forEach((partId) => {
+          const pStr = partId.toString();
+          if (pStr === senderIdStr || !isReceiverBlocked) {
+            const unreadCount = conversation.unreadCounts
+              ? (typeof conversation.unreadCounts.get === "function"
+                ? conversation.unreadCounts.get(pStr)
+                : conversation.unreadCounts[pStr]) || 0
+              : 0;
+
+            const updatePayload = {
+              conversationId: conversation._id.toString(),
+              lastMessage: messageData,
+              updatedAt: conversation.lastMessageAt,
+              unreadCount,
+            };
+
+            io.to(`user:${pStr}`).emit("conversation_updated", updatePayload);
+            io.to(`user:${pStr}`).emit("new_message_notification", messageData);
+          }
+        });
+      }
+
+      res.status(201).json({
+        success: true,
+        message: "Reply sent successfully",
+        data: messageData,
+      });
+    } catch (error) {
+      console.error("Error processing notification reply:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to process notification reply",
+      });
+    }
+  }
+);
+
 module.exports = router;

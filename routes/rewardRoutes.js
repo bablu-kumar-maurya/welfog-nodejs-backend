@@ -5,6 +5,7 @@ const RewardRule = require("../models/RewardRule");
 const RewardHistory = require("../models/RewardHistory");
 const Wallet = require("../models/Wallet");
 const WalletTransaction = require("../models/WalletTransaction");
+const CoinSetting = require("../models/CoinSetting");
 const walletService = require("../services/walletService");
 
 /**
@@ -173,6 +174,75 @@ router.get("/wallet/:userId", async (req, res) => {
   } catch (error) {
     console.error("❌ Error fetching wallet:", error);
     return res.status(500).json({ success: false, message: "Error fetching wallet" });
+  }
+});
+
+/**
+ * GET /api/rewards/coin-setting
+ * Fetch active Coin to Rupee conversion rate
+ */
+router.get("/coin-setting", async (req, res) => {
+  try {
+    let setting = await CoinSetting.findOne().sort({ updatedAt: -1 });
+    if (!setting) {
+      setting = await CoinSetting.create({
+        coins: 1,
+        rupees: 5,
+        currency: "INR",
+        currencySymbol: "₹",
+        updatedBy: "admin",
+      });
+    }
+    return res.status(200).json({ success: true, setting });
+  } catch (error) {
+    console.error("❌ Error fetching coin setting:", error);
+    return res.status(500).json({ success: false, message: "Error fetching coin setting" });
+  }
+});
+
+/**
+ * POST /api/rewards/coin-setting
+ * Create or update Coin to Rupee conversion rate
+ */
+router.post("/coin-setting", async (req, res) => {
+  try {
+    const { coins = 1, rupees, updatedBy } = req.body;
+
+    const coinsNum = Number(coins);
+    const rupeesNum = Number(rupees);
+
+    if (isNaN(coinsNum) || coinsNum <= 0 || isNaN(rupeesNum) || rupeesNum < 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Coins and rupees must be valid positive numbers",
+      });
+    }
+
+    let setting = await CoinSetting.findOne().sort({ updatedAt: -1 });
+
+    if (setting) {
+      setting.coins = coinsNum;
+      setting.rupees = rupeesNum;
+      if (updatedBy) setting.updatedBy = updatedBy;
+      await setting.save();
+    } else {
+      setting = await CoinSetting.create({
+        coins: coinsNum,
+        rupees: rupeesNum,
+        currency: "INR",
+        currencySymbol: "₹",
+        updatedBy: updatedBy || "admin",
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: `Coin conversion rate updated: ${coinsNum} Coin = ₹${rupeesNum}`,
+      setting,
+    });
+  } catch (error) {
+    console.error("❌ Error updating coin setting:", error);
+    return res.status(500).json({ success: false, message: "Error updating coin setting" });
   }
 });
 

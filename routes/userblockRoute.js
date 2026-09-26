@@ -4,7 +4,7 @@ const User = require("../models/Users");
 const Reel4test = require("../models/Reel");
 const ReelInteraction = require("../models/ReelInteraction");
 const logUserAction = require("../utils/logUserAction");
-
+const mongoose = require("mongoose");
 
 // 1️⃣ BLOCK USER API (SUPERFAST)
 router.post("/block-user", async (req, res) => {
@@ -112,34 +112,39 @@ router.get("/blocked-users/:id", async (req, res) => {
   try {
     const { id } = req.params;
 
-    // 🚀 OPTIMIZATION: Early ObjectId validation (Fail Fast - bina database jaye hi invalid ID reject ho jayegi)
-    if (!mongoose.isValidObjectId(id)) {
-      return res.status(400).json({ success: false, message: "Invalid user ID" });
-    }
+    // userid ya MongoDB _id dono support karega
+    const query = mongoose.isValidObjectId(id)
+      ? { _id: id }
+      : { userid: id };
 
-    const user = await User.findById(id)
+    const user = await User.findOne(query)
       .select("blockedUsers")
       .populate({
         path: "blockedUsers",
-        select: "username profilePicture name userid"
+        select: "username profilePicture name userid",
       })
       .lean();
 
     if (!user) {
-      return res.status(404).json({ success: false, message: "User not found" });
+      return res.status(404).json({
+        success: false,
+        message: "User not found",
+      });
     }
 
-    res.status(200).json({
+    return res.status(200).json({
       success: true,
-      totalBlockedUsers: user.blockedUsers ? user.blockedUsers.length : 0,
-      blockedUsers: user.blockedUsers || []
+      totalBlockedUsers: user.blockedUsers?.length || 0,
+      blockedUsers: user.blockedUsers || [],
     });
-
   } catch (error) {
     console.error("Blocked Users API Error:", error);
-    if (!res.headersSent) {
-      res.status(500).json({ success: false, message: "Server Error" });
-    }
+
+    return res.status(500).json({
+      success: false,
+      message: "Server Error",
+      error: error.message, // development me actual error dekhne ke liye
+    });
   }
 });
 

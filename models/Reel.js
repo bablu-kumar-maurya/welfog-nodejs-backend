@@ -13,7 +13,6 @@ const reelSchema = new mongoose.Schema(
     username: { type: String, required: true },
     name: { type: String, default: "" },
 
-   
     seller_id: { type: String, default: "" },
     userseller_id: { type: String, default: "" },
 
@@ -39,6 +38,9 @@ const reelSchema = new mongoose.Schema(
     },
 
     caption: { type: String },
+    // 🔥 New Hashtags Array Field
+    hashtags: [{ type: String, index: true }],
+
     captionTime: { type: Date },
     captionUpdatedAt: { type: Date },
     category: { type: String },
@@ -75,7 +77,9 @@ const reelSchema = new mongoose.Schema(
   { timestamps: true },
 );
 
-// ================= AUTO SYNC USER DATA & CAPTION TIME =================
+// ================= AUTO SYNC USER DATA, CAPTION TIME & HASHTAGS =================
+
+// ================= AUTO SYNC USER DATA, CAPTION TIME & HASHTAGS =================
 
 reelSchema.pre("save", async function (next) {
   try {
@@ -85,6 +89,36 @@ reelSchema.pre("save", async function (next) {
         this.captionTime = now;
       }
       this.captionUpdatedAt = now;
+
+      // 1. Hashtags extract karna
+      const extractedTags = (this.caption.match(/#[\w\u0590-\u05ff]+/g) || [])
+        .map((tag) => tag.replace("#", "").toLowerCase().trim());
+
+      const uniqueTags = Array.from(new Set(extractedTags));
+      this.hashtags = uniqueTags; // Reel me save karne ke liye
+
+      // 🔥 2. NAYA LOGIC: Hashtag collection me COUNT update karna
+      if (uniqueTags.length > 0 && this.isNew) {
+        // this.isNew isliye taaki sirf nayi reel upload par count badhe
+        const Hashtag = require("./hashtag"); // Hashtag model ka path apne folder ke hisaab se check karein
+
+        const bulkOps = uniqueTags.map(tag => ({
+          updateOne: {
+            filter: { name: tag },
+            update: {
+              $inc: {
+                count: 1
+              },
+              $set: {
+                lastUsedAt: now
+              }
+            },
+            upsert: true
+          }
+        }));
+
+        await Hashtag.bulkWrite(bulkOps);
+      }
     }
 
     if (!this.isModified("user") && !this.isNew) return next();

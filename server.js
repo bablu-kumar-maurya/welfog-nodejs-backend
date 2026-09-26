@@ -29,12 +29,12 @@ const rateLimit = require("express-rate-limit");
 app.use((req, res, next) => {
   res.header("Cross-Origin-Opener-Policy", "same-origin");
   res.header("Cross-Origin-Embedder-Policy", "require-corp");
-  
+
   console.log(`\n======================================================`);
   console.log(`📡 [Incoming Request]: ${req.method} ${req.originalUrl || req.url}`);
   console.log(`📋 [Headers]: origin=${req.headers.origin || 'none'}, content-type=${req.headers["content-type"] || 'none'}`);
   console.log(`📱 [Device Headers]: x-android-id=${req.headers["x-android-id"] || 'none'}`);
-  
+
   next();
 });
 
@@ -125,7 +125,7 @@ const isPublicShareRoute = (req) => {
 
 const requireDeviceId = (req, res, next) => {
   console.log(`🔐 [DeviceAuth] Checking authorization for path: ${req.path}`);
-  
+
   // ✅ EXACT FIX FOR FRONTEND UPLOAD CRASH: Pre-flight OPTIONS Bypass
   if (req.method === 'OPTIONS') {
     console.log(`✅ [DeviceAuth] OPTIONS request bypassed.`);
@@ -156,7 +156,7 @@ const requireDeviceId = (req, res, next) => {
       message: "Access Denied: Missing Device ID. Direct API access is strictly prohibited."
     });
   }
-  
+
   console.log(`✅ [DeviceAuth] Access granted for ${req.path}`);
   next();
 };
@@ -264,6 +264,7 @@ const chatRoutes = require("./routes/chatRoutes");
 const likeRoutes = require("./routes/likeRoutes");
 const viewRoutes = require("./routes/viewRoutes");
 const rewardRoutes = require("./routes/rewardRoutes");
+const routehashtags = require("./routes/routehashtags");
 
 console.log("🛤️ Mounting Routes...");
 app.use("/api/users", userRoutes);
@@ -281,6 +282,7 @@ app.use("/api/chat", chatRoutes);
 app.use("/api/likes", likeRoutes);
 app.use("/api/views", viewRoutes);
 app.use("/api/rewards", rewardRoutes);
+app.use("/api/hashtags", routehashtags);
 console.log("✅ All routes mounted.");
 
 app.get("/", (req, res) => {

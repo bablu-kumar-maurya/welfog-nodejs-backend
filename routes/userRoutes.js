@@ -450,7 +450,7 @@ router.get("/search_populer", async (req, res) => {
         _id: { $in: randomReelIds }
       })
         .select(
-          "userid username name videoUrl thumbnailUrl caption likes views createdAt music",
+          "userid username name videoUrl thumbnailUrl caption likes views createdAt music hashtags",
         )
         .populate("music", "title artist thumbnail");
 
@@ -535,8 +535,10 @@ router.get("/search_populer", async (req, res) => {
       hasMoreUsers = users.length === userLimit;
     }
 
-    // 🎬 VIDEO SEARCH
+    // 🎬 VIDEO SEARCH (Hashtag Support Added)
     if (hasVideoPagination) {
+      const cleanTag = query.replace("#", "").toLowerCase().trim();
+
       const videoQuery = [
         {
           username: {
@@ -558,6 +560,14 @@ router.get("/search_populer", async (req, res) => {
             $options: "i",
           },
         },
+
+        // 🔥 Hashtag Match Logic
+        {
+          hashtags: {
+            $regex: cleanTag,
+            $options: "i",
+          },
+        },
       ];
 
       // 🎵 Match Music
@@ -575,6 +585,7 @@ router.get("/search_populer", async (req, res) => {
           },
         });
       }
+
       videos = await Reel.find({
         $or: videoQuery,
         status: "Published",
@@ -582,14 +593,16 @@ router.get("/search_populer", async (req, res) => {
         _id: { $nin: notInterestedReelsList },
       })
         .select(
-          "userid username name videoUrl thumbnailUrl caption likes views createdAt music",
+          "userid username name videoUrl thumbnailUrl caption likes views createdAt music hashtags",
         )
         .populate("music", "title artist thumbnail")
         .sort({ views: -1, createdAt: -1 })
         .skip(videoSkip)
         .limit(videoLimit);
+
       hasMoreVideos = videos.length === videoLimit;
     }
+
     return res.status(200).json({
       users,
       videos,
